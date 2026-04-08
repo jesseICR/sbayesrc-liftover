@@ -11,6 +11,8 @@ bash main.sh
 
 That's it. The script creates a virtual environment in `tools/venv/`, installs dependencies from `requirements.txt`, downloads `snp.info` and all reference files on first run (see [Storage](#storage)), caches everything, and produces the output files.
 
+**Nothing is installed globally.** All Python packages, binaries, and reference data are stored inside the repo directory (`tools/`, `tmp/`). Delete the repo and there is zero trace left on your system.
+
 Pre-built output files are also available as [GitHub Release](https://github.com/jesseICR/sbayesrc-liftover/releases) assets — no pipeline run required.
 
 ### Docker

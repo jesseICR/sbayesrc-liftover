@@ -35,7 +35,7 @@ pd.set_option("future.no_silent_downcasting", True)
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.getcwd()
 TOOLS = os.path.join(ROOT, "tools")
 BIN = os.path.join(TOOLS, "bin")
 TMP = os.path.join(ROOT, "tmp")

@@ -4,28 +4,28 @@ liftover.py  --  Lift SBayesRC snp.info from hg19 (GRCh37) to hg38 (GRCh38).
 
 Pipeline:
   1. UCSC liftOver           position-based coordinate conversion
-  2. FASTA ref check         flag suspects where neither allele matches hg38 ref
-  3. dbSNP cross-validation  catch liftOver errors invisible to FASTA, fill gaps
-  4. Ensembl cross-validation  validate unverified positions, rescue remaining
-  5. Allele annotation       strand complement + ref/alt determination
+  2. dbSNP cross-validation  confirm liftOver positions, rescue failures, discard conflicts
+  3. FASTA reference check   verify dbSNP ref matches hg38 FASTA at each position
+  4. Allele annotation       strand complement + ref/alt determination
+
+Every SNP in the final output (sbayesrc_hg38.csv) must satisfy ALL of:
+  1. Its rsID exists in dbSNP with a matching hg38 chrom and position
+  2. If UCSC liftOver succeeded, the liftOver position must equal the dbSNP position
+  3. The dbSNP reference allele must match the hg38 FASTA reference base
 
 Usage:
     bash main.sh
-    ENSEMBL_FULL=1 bash main.sh             # exhaustive Ensembl validation (~3h, cached)
 
 Input:  snp.info   (SBayesRC tab-delimited, hg19 coordinates)
 Output: sbayesrc_hg38.csv              (clean: chrom, pos, ref, alt, rsid)
         sbayesrc_liftover_results.csv  (verbose: all columns, all SNPs)
 """
 import gzip
-import json
 import os
 import platform
 import subprocess
 import sys
-import time
 import urllib.request
-from urllib.error import HTTPError, URLError
 
 import pandas as pd
 import pysam
@@ -45,13 +45,11 @@ CHAIN = os.path.join(TOOLS, "hg19ToHg38.over.chain.gz")
 HG38_FA = os.path.join(TOOLS, "hg38.fa")
 HG38_FA_GZ = HG38_FA + ".gz"
 DBSNP_TSV = os.path.join(TOOLS, "dbsnp_lookup.tsv")
-ENSEMBL_CACHE = os.path.join(TMP, "ensembl_cache.json")
 
 SNPINFO_URL = "https://github.com/jesseICR/sbayesrc-liftover/releases/download/v1.0/snp.info"
 CHAIN_URL = "https://hgdownload.soe.ucsc.edu/goldenPath/hg19/liftOver/hg19ToHg38.over.chain.gz"
 HG38_URL = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz"
 DBSNP_URL = "https://ftp.ncbi.nlm.nih.gov/snp/latest_release/VCF/GCF_000001405.40.gz"
-ENSEMBL_URL = "https://rest.ensembl.org/variation/homo_sapiens"
 
 COMPLEMENT = {"A": "T", "T": "A", "C": "G", "G": "C"}
 
@@ -69,7 +67,7 @@ REFSEQ_TO_CHROM = {
 
 
 # ---------------------------------------------------------------------------
-# Setup  (idempotent — each download skips if the file exists)
+# Setup  (idempotent -- each download skips if the file exists)
 # ---------------------------------------------------------------------------
 def _liftover_platform():
     s, m = platform.system(), platform.machine()
@@ -117,15 +115,13 @@ def setup():
 
 def build_dbsnp_lookup(rsid_set):
     """Stream dbSNP VCF directly from NCBI FTP, extracting rows that match our rsIDs.
-    The full 28 GB VCF is streamed and decompressed on the fly — only the small
+    The full 28 GB VCF is streamed and decompressed on the fly -- only the small
     lookup TSV (~200 MB) is saved to disk."""
     if os.path.isfile(DBSNP_TSV):
         print("  [skip] dbSNP lookup table", flush=True)
         return
     print(f"  [build] dbSNP lookup for {len(rsid_set):,} rsIDs "
           f"(streaming ~28 GB VCF, 15-30 min) ...", flush=True)
-    # Stream VCF: curl decompresses on the fly via --compressed, but the file
-    # is gzipped (not HTTP-compressed), so we pipe through gunzip ourselves.
     proc = subprocess.Popen(
         ["curl", "-sfSL", "--retry", "3", DBSNP_URL],
         stdout=subprocess.PIPE,
@@ -163,7 +159,7 @@ def _open_fasta():
     return _FA
 
 
-def _fasta_ref(df_sub, label=""):
+def _fasta_ref(df_sub):
     """Look up the hg38 reference base for rows with chrom + pos_hg38 columns.
     Returns Series of uppercase ref bases indexed by the DataFrame index."""
     fa = _open_fasta()
@@ -173,55 +169,6 @@ def _fasta_ref(df_sub, label=""):
         fa.fetch(c, p - 1, p).upper() for c, p in zip(chroms, positions)
     ]
     return pd.Series(bases, index=df_sub.index)
-
-
-def _ensembl_post(rsids):
-    """POST up to 200 rsIDs to the Ensembl REST API."""
-    data = json.dumps({"ids": rsids}).encode()
-    req = urllib.request.Request(
-        ENSEMBL_URL, data=data,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode())
-
-
-def _ensembl_query(rsid_list, cache, label=""):
-    """Query Ensembl for rsIDs not yet in cache. Saves cache periodically."""
-    uncached = [rs for rs in rsid_list if rs not in cache]
-    if not uncached:
-        return
-    n_batches = (len(uncached) + 199) // 200
-    print(f"  [query] {len(uncached):,} {label} rsIDs ({n_batches:,} batches) ...",
-          flush=True)
-    for i in range(0, len(uncached), 200):
-        batch = uncached[i : i + 200]
-        batch_num = i // 200 + 1
-        try:
-            result = _ensembl_post(batch)
-            for rsid, info in result.items():
-                if "error" in info:
-                    cache[rsid] = None
-                    continue
-                hit = None
-                for m in info.get("mappings", []):
-                    if m.get("assembly_name") == "GRCh38" and m.get("seq_region_name", "").isdigit():
-                        hit = {"chrom": int(m["seq_region_name"]), "pos": m["start"]}
-                        break
-                cache[rsid] = hit
-        except (HTTPError, URLError, TimeoutError) as e:
-            print(f"    batch {batch_num}: {e}", flush=True)
-            for rsid in batch:
-                cache.setdefault(rsid, None)
-        if batch_num % 500 == 0:
-            with open(ENSEMBL_CACHE, "w") as f:
-                json.dump(cache, f)
-            print(f"    {i + len(batch):,} / {len(uncached):,} "
-                  f"({(i + len(batch)) / len(uncached) * 100:.1f}%)", flush=True)
-        if i + 200 < len(uncached):
-            time.sleep(0.5)
-    with open(ENSEMBL_CACHE, "w") as f:
-        json.dump(cache, f)
 
 
 # ---------------------------------------------------------------------------
@@ -255,242 +202,171 @@ def step_liftover(df):
         bed_out, sep="\t", header=None,
         names=["chrom38", "start", "end", "idx", "score", "strand_out"],
     )
-    mapped["pos_hg38"] = mapped["start"] + 1
+    mapped["pos_liftover"] = mapped["start"] + 1
     mapped["lo_chrom"] = mapped["chrom38"].str.replace("chr", "", regex=False)
     mapped["strand_flip"] = mapped["strand_out"] == "-"
 
     # Join back on index (keep first hit if liftOver multi-maps a region)
     mapped = mapped.drop_duplicates("idx").set_index("idx")
-    df = df.join(mapped[["pos_hg38", "lo_chrom", "strand_flip"]])
+    df = df.join(mapped[["pos_liftover", "lo_chrom", "strand_flip"]])
 
     # Discard chromosome-changed mappings
-    has_map = df["pos_hg38"].notna()
+    has_map = df["pos_liftover"].notna()
     chrom_changed = has_map & (df["chrom"].astype(str) != df["lo_chrom"])
     truly_unmapped = ~has_map
 
-    df.loc[chrom_changed, ["pos_hg38", "strand_flip"]] = [-1, False]
-    df["pos_hg38"]    = df["pos_hg38"].fillna(-1).astype(int)
+    df.loc[chrom_changed, ["pos_liftover", "strand_flip"]] = [-1, False]
+    df["pos_liftover"] = df["pos_liftover"].fillna(-1).astype(int)
     df["strand_flip"]  = df["strand_flip"].fillna(False).astype(bool)
-    df["method"] = ""
-    df.loc[df["pos_hg38"] != -1, "method"] = "liftover"
     df.drop(columns=["lo_chrom"], inplace=True)
 
-    n_ok = (df["method"] == "liftover").sum()
+    n_ok = (df["pos_liftover"] != -1).sum()
+    n_flip = df["strand_flip"].sum()
     print(f"  Mapped:         {n_ok:>10,}")
     print(f"  Unmapped:       {truly_unmapped.sum():>10,}")
     print(f"  Chrom changed:  {chrom_changed.sum():>10,}")
-    print(f"  Strand-flipped: {df['strand_flip'].sum():>10,}")
+    print(f"  Strand-flipped: {n_flip:>10,}")
     return df
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Preliminary FASTA check  (flag liftOver suspects)
-# ---------------------------------------------------------------------------
-def step_fasta_suspects(df):
-    lo = df[df["method"] == "liftover"]
-    print(f"\n[Step 2] FASTA ref check ({len(lo):,} liftOver positions)", flush=True)
-
-    ref = _fasta_ref(lo, "suspects")
-    a1_match = lo["A1"] == lo.index.map(ref)
-    a2_match = lo["A2"] == lo.index.map(ref)
-    suspects = set(lo.loc[~a1_match & ~a2_match, "ID"])
-    print(f"  Suspects (neither allele matches ref): {len(suspects)}")
-    return suspects, ref
-
-
-# ---------------------------------------------------------------------------
-# Step 3: dbSNP cross-validation
+# Step 2: dbSNP cross-validation
 # ---------------------------------------------------------------------------
 def step_dbsnp(df):
-    print(f"\n[Step 3] dbSNP cross-validation", flush=True)
+    print(f"\n[Step 2] dbSNP cross-validation", flush=True)
 
-    dbsnp = pd.read_csv(DBSNP_TSV, sep="\t")
+    dbsnp = pd.read_csv(DBSNP_TSV, sep="\t", dtype={"chrom": str})
     print(f"  Loaded {len(dbsnp):,} dbSNP entries")
 
-    df = df.merge(
-        dbsnp[["rsid", "pos"]].drop_duplicates("rsid")
-            .rename(columns={"rsid": "ID", "pos": "dbsnp_pos"}),
-        on="ID", how="left",
+    # Merge dbSNP chrom, pos, ref onto the dataframe
+    dbsnp_dedup = (
+        dbsnp[["rsid", "chrom", "pos", "ref"]]
+        .drop_duplicates("rsid")
+        .rename(columns={
+            "rsid": "ID",
+            "chrom": "dbsnp_chrom",
+            "pos": "pos_dbsnp",
+            "ref": "dbsnp_ref",
+        })
     )
-    df["dbsnp_pos"] = df["dbsnp_pos"].fillna(-1).astype(int)
+    df = df.merge(dbsnp_dedup, on="ID", how="left")
+    df["pos_dbsnp"]    = df["pos_dbsnp"].fillna(-1).astype(int)
+    df["dbsnp_chrom"]  = df["dbsnp_chrom"].fillna("")
+    df["dbsnp_ref"]    = df["dbsnp_ref"].fillna("")
 
-    has_lo = df["pos_hg38"] != -1
-    has_db = df["dbsnp_pos"] != -1
-    agree    = has_lo & has_db & (df["pos_hg38"] == df["dbsnp_pos"])
-    disagree = has_lo & has_db & (df["pos_hg38"] != df["dbsnp_pos"])
-    fallback = ~has_lo & has_db
+    # Classify each SNP (mutually exclusive, exhaustive)
+    has_lo = df["pos_liftover"] != -1
+    has_db = df["pos_dbsnp"] != -1
+    db_chrom_ok = df["chrom"].astype(str) == df["dbsnp_chrom"]
+    db_usable = has_db & db_chrom_ok
 
-    checked = set(df.loc[has_db, "ID"])
+    confirmed = has_lo & db_usable & (df["pos_liftover"] == df["pos_dbsnp"])
+    conflict  = has_lo & has_db & ~confirmed   # liftOver mapped but dbSNP disagrees (pos or chrom)
+    rescue    = ~has_lo & db_usable
+    no_dbsnp  = has_lo & ~has_db               # liftOver worked but no dbSNP to confirm
+    unmapped  = ~has_lo & ~db_usable           # neither source provides a usable position
 
-    print(f"  Agree:           {agree.sum():>10,}")
-    print(f"  Disagree:        {disagree.sum():>10,}")
-    print(f"  Fallback:        {fallback.sum():>10,}")
-    print(f"  No dbSNP entry:  {(~has_db).sum():>10,}")
+    df["status"] = ""
+    df.loc[confirmed, "status"] = "confirmed"
+    df.loc[conflict,  "status"] = "conflict"
+    df.loc[rescue,    "status"] = "rescue"
+    df.loc[no_dbsnp,  "status"] = "no_dbsnp"
+    df.loc[unmapped,  "status"] = "unmapped"
 
-    # Override disagreements — but only if the dbSNP position has a ref allele
-    # that matches one of our alleles (or their complements). This guards against
-    # cases where dbSNP maps an rsID to a position with a different variant.
-    if disagree.any():
-        dis = df.loc[disagree].copy()
-        # Check FASTA ref at each dbSNP position
-        dis_for_ref = pd.DataFrame({
-            "chrom": dis["chrom"], "pos_hg38": dis["dbsnp_pos"],
-        }, index=dis.index)
-        dis_ref = _fasta_ref(dis_for_ref, "dbsnp-check")
-        ref_ok = (
-            (dis_ref == dis["A1"]) | (dis_ref == dis["A2"]) |
-            (dis_ref == dis["A1"].map(COMPLEMENT)) |
-            (dis_ref == dis["A2"].map(COMPLEMENT))
-        )
-        valid = disagree & df.index.isin(dis.index[ref_ok])
-        for rsid in df.loc[valid, "ID"]:
-            print(f"    override: {rsid}")
-        for rsid in df.loc[disagree & ~df.index.isin(dis.index[ref_ok]), "ID"]:
-            print(f"    skip (ref mismatch at dbSNP pos): {rsid}")
-        df.loc[valid, "pos_hg38"] = df.loc[valid, "dbsnp_pos"]
-        df.loc[valid, "method"] = "dbsnp"
-        df.loc[valid, "strand_flip"] = False
+    # Set pos_hg38: confirmed use liftOver pos, rescue use dbSNP pos, rest get -1
+    df["pos_hg38"] = -1
+    df.loc[confirmed, "pos_hg38"] = df.loc[confirmed, "pos_liftover"]
+    df.loc[rescue,    "pos_hg38"] = df.loc[rescue,    "pos_dbsnp"]
 
-    # Fill gaps
-    df.loc[fallback, "pos_hg38"] = df.loc[fallback, "dbsnp_pos"]
-    df.loc[fallback, "method"] = "dbsnp"
+    print(f"  Confirmed (liftOver = dbSNP):              {confirmed.sum():>10,}")
+    print(f"  Conflict  (liftOver != dbSNP):             {conflict.sum():>10,}")
+    print(f"  Rescue    (liftOver failed, dbSNP rescue): {rescue.sum():>10,}")
+    print(f"  No dbSNP  (liftOver OK, no dbSNP entry):  {no_dbsnp.sum():>10,}")
+    print(f"  Unmapped  (neither source):                {unmapped.sum():>10,}")
 
-    df.drop(columns=["dbsnp_pos"], inplace=True)
-    return df, checked
-
-
-# ---------------------------------------------------------------------------
-# Step 4: Ensembl cross-validation
-# ---------------------------------------------------------------------------
-def step_ensembl(df, suspects, dbsnp_checked):
-    still_unmapped      = set(df.loc[df["pos_hg38"] == -1, "ID"])
-    unresolved_suspects = suspects & set(df.loc[df["method"] == "liftover", "ID"])
-    unverified          = set(df.loc[df["method"] == "liftover", "ID"]) - dbsnp_checked
-    high_priority       = still_unmapped | unresolved_suspects
-
-    print(f"\n[Step 4] Ensembl cross-validation", flush=True)
-    print(f"  Unmapped:          {len(still_unmapped):>10,}")
-    print(f"  Unresolved suspects: {len(unresolved_suspects):>10,}")
-    print(f"  Unverified:        {len(unverified):>10,}")
-
-    # Load cache
-    cache = {}
-    if os.path.isfile(ENSEMBL_CACHE):
-        with open(ENSEMBL_CACHE) as f:
-            cache = json.load(f)
-    print(f"  Cache:             {len(cache):>10,} entries")
-
-    # Always query high-priority
-    if high_priority:
-        _ensembl_query(list(high_priority), cache, "high-priority")
-
-    # Full validation (opt-in)
-    if os.environ.get("ENSEMBL_FULL") == "1":
-        _ensembl_query(list(unverified), cache, "unverified")
-    else:
-        n_uncached = sum(1 for rs in unverified if rs not in cache)
-        if n_uncached:
-            print(f"  {n_uncached:,} unverified SNPs not in cache "
-                  f"(set ENSEMBL_FULL=1 to query, ~3-4 h)")
-
-    # Build lookup from cache -> merge (vectorized, not row-by-row)
-    # Iterate cache (small) checking membership, not applicable (huge) checking cache
-    applicable = high_priority | unverified
-    rows = [(rsid, info["chrom"], info["pos"])
-            for rsid, info in cache.items()
-            if info is not None and rsid in applicable]
-
-    if not rows:
-        print(f"  Nothing to apply")
-        n_still = (df["pos_hg38"] == -1).sum()
-        print(f"  Unmapped:   {n_still:>6,}", flush=True)
-        return df
-
-    ens = pd.DataFrame(rows, columns=["ID", "ens_chrom", "ens_pos"])
-    df = df.merge(ens, on="ID", how="left")
-    df["ens_pos"]   = df["ens_pos"].fillna(-1).astype(int)
-    df["ens_chrom"] = df["ens_chrom"].fillna(-1).astype(int)
-
-    valid    = (df["ens_pos"] != -1) & (df["ens_chrom"] == df["chrom"])
-    rescue   = valid & (df["pos_hg38"] == -1)
-    override = valid & (df["pos_hg38"] != -1) & (df["pos_hg38"] != df["ens_pos"])
-
-    # Log overrides before applying
-    if override.any():
-        for _, r in df.loc[override, ["ID", "pos_hg38", "ens_pos"]].iterrows():
-            print(f"    override: {r.ID}  "
-                  f"liftover={int(r.pos_hg38)}  ensembl={int(r.ens_pos)}")
-
-    df.loc[rescue,   "pos_hg38"] = df.loc[rescue,   "ens_pos"]
-    df.loc[rescue,   "method"]   = "ensembl"
-    df.loc[override, "pos_hg38"] = df.loc[override, "ens_pos"]
-    df.loc[override, "method"]   = "ensembl"
-    df.loc[override, "strand_flip"] = False
-
-    df.drop(columns=["ens_pos", "ens_chrom"], inplace=True)
-
-    print(f"  Rescued:    {rescue.sum():>6,}")
-    print(f"  Overridden: {override.sum():>6,}")
-    print(f"  Unmapped:   {(df['pos_hg38'] == -1).sum():>6,}", flush=True)
+    df.drop(columns=["dbsnp_chrom"], inplace=True)
     return df
 
 
 # ---------------------------------------------------------------------------
-# Step 5: Final allele annotation
+# Step 3: FASTA reference validation
 # ---------------------------------------------------------------------------
-def step_annotate(df, cached_ref=None):
-    print(f"\n[Step 5] Allele annotation", flush=True)
+def step_fasta_validation(df):
+    checkable = df["status"].isin(["confirmed", "rescue"])
+    n_check = checkable.sum()
+    print(f"\n[Step 3] FASTA reference validation ({n_check:,} SNPs)", flush=True)
 
+    # Fetch the hg38 FASTA ref base at each position
+    sub = df.loc[checkable]
+    fasta_ref = _fasta_ref(sub)
+    df["fasta_ref"] = ""
+    df.loc[checkable, "fasta_ref"] = fasta_ref
+
+    # Check 1: dbSNP ref must match FASTA ref
+    fasta_mismatch = checkable & (df["dbsnp_ref"] != df["fasta_ref"])
+    n_fasta_mismatch = fasta_mismatch.sum()
+    df.loc[fasta_mismatch, "status"] = "fasta_mismatch"
+    df.loc[fasta_mismatch, "pos_hg38"] = -1
+
+    # Check 2: at least one allele (or complement) matches FASTA ref
+    still_ok = df["status"].isin(["confirmed", "rescue"])
+    allele_ok = (
+        (df["A1"] == df["fasta_ref"]) | (df["A2"] == df["fasta_ref"]) |
+        (df["A1"].map(COMPLEMENT) == df["fasta_ref"]) |
+        (df["A2"].map(COMPLEMENT) == df["fasta_ref"])
+    )
+    allele_mismatch = still_ok & ~allele_ok
+    n_allele_mismatch = allele_mismatch.sum()
+    df.loc[allele_mismatch, "status"] = "allele_mismatch"
+    df.loc[allele_mismatch, "pos_hg38"] = -1
+
+    n_passed = df["status"].isin(["confirmed", "rescue"]).sum()
+    print(f"  dbSNP ref matches FASTA ref:  {(n_check - n_fasta_mismatch):>10,}")
+    print(f"  dbSNP ref != FASTA ref:       {n_fasta_mismatch:>10,}")
+    print(f"  Allele matches FASTA ref:     {(n_check - n_fasta_mismatch - n_allele_mismatch):>10,}")
+    print(f"  Neither allele matches ref:   {n_allele_mismatch:>10,}")
+    print(f"  Passed FASTA validation:      {n_passed:>10,}")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Step 4: Allele annotation
+# ---------------------------------------------------------------------------
+def step_annotate(df):
+    print(f"\n[Step 4] Allele annotation", flush=True)
+
+    passed = df["status"].isin(["confirmed", "rescue"])
     df["A1_hg38"] = df["A1"]
     df["A2_hg38"] = df["A2"]
 
-    # Complement strand-flipped liftOver alleles.
-    # For strand-ambiguous SNPs (A/T, C/G) this swaps labels but not nucleotides —
-    # the flip is still real (detected from the chain alignment, not from alleles).
-    lo_flip = df["strand_flip"] & (df["method"] == "liftover")
+    # Complement strand-flipped liftOver alleles (confirmed SNPs only)
+    lo_flip = passed & (df["status"] == "confirmed") & df["strand_flip"]
     if lo_flip.any():
         df.loc[lo_flip, "A1_hg38"] = df.loc[lo_flip, "A1"].map(COMPLEMENT)
         df.loc[lo_flip, "A2_hg38"] = df.loc[lo_flip, "A2"].map(COMPLEMENT)
+        print(f"  Complemented {lo_flip.sum()} strand-flipped liftOver SNPs")
 
-    # Query hg38 FASTA for all mapped positions (reuse step 2 results where possible)
-    mapped = df[df["pos_hg38"] != -1]
-    if cached_ref is not None:
-        # Exclude overridden SNPs — their positions changed since step 2
-        still_lo = mapped.index[mapped["method"] == "liftover"]
-        valid_cache = cached_ref.loc[cached_ref.index.intersection(still_lo)]
-        new = mapped.loc[mapped.index.difference(valid_cache.index)]
-        print(f"  FASTA query for {len(new):,} new positions "
-              f"({len(valid_cache):,} cached from step 2) ...", flush=True)
-        ref = pd.concat([valid_cache, _fasta_ref(new, "final")]) if len(new) else valid_cache
-    else:
-        print(f"  FASTA query for {len(mapped):,} positions ...", flush=True)
-        ref = _fasta_ref(mapped, "final")
-    df["ref_hg38"] = df.index.map(ref).fillna("")
-
-    # Non-liftOver SNPs: complement if needed (alleles may be on opposite strand)
-    non_lo = df["method"].isin(["dbsnp", "ensembl"])
-    if non_lo.any():
-        sub = df.loc[non_lo]
-        no_match = (sub["A1"] != sub["ref_hg38"]) & (sub["A2"] != sub["ref_hg38"])
-        comp_ok  = (sub["A1"].map(COMPLEMENT) == sub["ref_hg38"]) | \
-                   (sub["A2"].map(COMPLEMENT) == sub["ref_hg38"])
-        needs = no_match & comp_ok
-        idx = sub.index[needs]
-        if len(idx):
-            df.loc[idx, "A1_hg38"] = df.loc[idx, "A1"].map(COMPLEMENT)
-            df.loc[idx, "A2_hg38"] = df.loc[idx, "A2"].map(COMPLEMENT)
-            df.loc[idx, "strand_flip"] = True
-            print(f"  Complemented {len(idx)} non-liftOver SNPs")
+    # Rescue SNPs: complement if needed (alleles may be on opposite strand)
+    rescue = passed & (df["status"] == "rescue")
+    if rescue.any():
+        sub = df.loc[rescue]
+        ref = df.loc[rescue, "fasta_ref"]
+        no_match = (sub["A1"] != ref) & (sub["A2"] != ref)
+        comp_ok  = (sub["A1"].map(COMPLEMENT) == ref) | \
+                   (sub["A2"].map(COMPLEMENT) == ref)
+        needs = rescue & df.index.isin(sub.index[no_match & comp_ok])
+        if needs.any():
+            df.loc[needs, "A1_hg38"] = df.loc[needs, "A1"].map(COMPLEMENT)
+            df.loc[needs, "A2_hg38"] = df.loc[needs, "A2"].map(COMPLEMENT)
+            df.loc[needs, "strand_flip"] = True
+            print(f"  Complemented {needs.sum()} rescue SNPs")
 
     # Determine which allele matches ref
     df["ref_match"] = ""
-    has_ref = df["ref_hg38"] != ""
-    df.loc[has_ref & (df["A2_hg38"] == df["ref_hg38"]), "ref_match"] = "A2_hg38"
-    df.loc[has_ref & (df["A1_hg38"] == df["ref_hg38"]), "ref_match"] = "A1_hg38"
-    neither = has_ref & (df["A1_hg38"] != df["ref_hg38"]) & (df["A2_hg38"] != df["ref_hg38"])
-    df.loc[neither, "ref_match"] = "neither"
+    df.loc[passed & (df["A1_hg38"] == df["fasta_ref"]), "ref_match"] = "A1_hg38"
+    df.loc[passed & (df["A2_hg38"] == df["fasta_ref"]), "ref_match"] = "A2_hg38"
 
-    for val, cnt in df.loc[has_ref, "ref_match"].value_counts().items():
+    for val, cnt in df.loc[passed, "ref_match"].value_counts().items():
         print(f"    {val:10s}  {cnt:>10,}")
     return df
 
@@ -499,9 +375,9 @@ def step_annotate(df, cached_ref=None):
 # Main
 # ---------------------------------------------------------------------------
 RESULTS_COLS = [
-    "chrom", "ID", "pos_hg19", "pos_hg38",
+    "chrom", "ID", "pos_hg19", "pos_hg38", "pos_liftover", "pos_dbsnp",
     "A1", "A2", "A1_hg38", "A2_hg38",
-    "ref_hg38", "ref_match", "strand_flip", "method",
+    "dbsnp_ref", "fasta_ref", "ref_match", "strand_flip", "status",
     "Index", "GenPos", "A1Freq", "N", "Block",
 ]
 
@@ -528,34 +404,51 @@ def main():
     build_dbsnp_lookup(set(df["ID"]))
 
     # Pipeline
-    df = step_liftover(df)                                  # 1
-    suspects, cached_ref = step_fasta_suspects(df)          # 2
-    df, dbsnp_checked = step_dbsnp(df)                      # 3
-    df = step_ensembl(df, suspects, dbsnp_checked)          # 4
-    df = step_annotate(df, cached_ref)                      # 5
+    df = step_liftover(df)           # 1
+    df = step_dbsnp(df)              # 2
+    df = step_fasta_validation(df)   # 3
+    df = step_annotate(df)           # 4
 
-    # Summary
-    n_un = (df["pos_hg38"] == -1).sum()
+    # ---- Final summary -------------------------------------------------------
+    n_total = len(df)
+    passed = df["status"].isin(["confirmed", "rescue"])
+    n_confirmed = (df["status"] == "confirmed").sum()
+    n_rescue    = (df["status"] == "rescue").sum()
+    n_conflict  = (df["status"] == "conflict").sum()
+    n_no_dbsnp  = (df["status"] == "no_dbsnp").sum()
+    n_unmapped  = (df["status"] == "unmapped").sum()
+    n_fasta     = (df["status"] == "fasta_mismatch").sum()
+    n_allele    = (df["status"] == "allele_mismatch").sum()
+
     print(f"\n{'=' * 60}")
-    print(f"Result: {len(df):,} SNPs")
-    for m, c in df.loc[df["method"] != "", "method"].value_counts().items():
-        print(f"  {m:12s} {c:>10,}")
-    print(f"  {'unmapped':12s} {n_un:>10,}")
+    print(f"FINAL SUMMARY: {n_total:,} SNPs")
+    print(f"{'=' * 60}")
+    print(f"\n  Included in sbayesrc_hg38.csv:")
+    print(f"    confirmed (liftOver + dbSNP agree):  {n_confirmed:>10,}")
+    print(f"    rescue    (dbSNP only):              {n_rescue:>10,}")
+    print(f"    TOTAL INCLUDED:                      {n_confirmed + n_rescue:>10,}")
+    print(f"\n  Excluded:")
+    print(f"    conflict  (liftOver != dbSNP):       {n_conflict:>10,}")
+    print(f"    no_dbsnp  (rsID not in dbSNP):       {n_no_dbsnp:>10,}")
+    print(f"    unmapped  (neither source):          {n_unmapped:>10,}")
+    print(f"    fasta_mismatch (dbSNP ref != FASTA): {n_fasta:>10,}")
+    print(f"    allele_mismatch (no allele = ref):   {n_allele:>10,}")
+    print(f"    TOTAL EXCLUDED:                      {n_conflict + n_no_dbsnp + n_unmapped + n_fasta + n_allele:>10,}")
     print(f"{'=' * 60}", flush=True)
 
-    # Write verbose liftover results (all SNPs, all columns)
+    # ---- Write verbose liftover results (all SNPs, all columns) ---------------
     results_csv = os.path.join(ROOT, "sbayesrc_liftover_results.csv")
     df[RESULTS_COLS].to_csv(results_csv, index=False)
     print(f"\nWritten to {os.path.basename(results_csv)}")
 
-    # Write clean hg38 output (mapped SNPs only: chrom, pos, ref, alt, rsid)
-    mapped = df[df["pos_hg38"] != -1].copy()
+    # ---- Write clean hg38 output (passed SNPs only) --------------------------
+    mapped = df[passed].copy()
     # alt = whichever allele is NOT the reference
     alt = mapped["A2_hg38"].where(mapped["ref_match"] == "A1_hg38", mapped["A1_hg38"])
     clean = pd.DataFrame({
         "chrom": mapped["chrom"],
         "pos": mapped["pos_hg38"],
-        "ref": mapped["ref_hg38"],
+        "ref": mapped["fasta_ref"],
         "alt": alt,
         "rsid": mapped["ID"],
     })

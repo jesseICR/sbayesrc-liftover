@@ -13,7 +13,7 @@ That's it. The script creates a virtual environment in `tools/venv/`, installs d
 
 **Nothing is installed globally.** All Python packages, binaries, and reference data are stored inside the repo directory (`tools/`, `tmp/`). Delete the repo and there is zero trace left on your system.
 
-Pre-built output files are also available as [GitHub Release](https://github.com/jesseICR/sbayesrc-liftover/releases) assets — no pipeline run required.
+Pre-built output files are also available as [GitHub Release](https://github.com/jesseICR/sbayesrc-liftover/releases) assets -- no pipeline run required.
 
 ### Docker
 
@@ -39,44 +39,81 @@ The ~5 GB of downloaded reference files are cached in `tools/` and reused on sub
 
 ## Why This Exists
 
-UCSC liftOver works well for the vast majority of SNPs, but it makes errors in **segmental duplication regions** (NBPF genes on chr1, HLA on chr6, etc.) where it maps variants to paralogous copies at the wrong position. These errors are invisible to simple allele-vs-reference checks when the allele coincidentally matches the reference at the wrong location.
+UCSC liftOver works well for the vast majority of SNPs, but it makes errors in **segmental duplication regions** (NBPF genes on chr1, HLA on chr6, etc.) where it maps variants to paralogous copies at the wrong position. These errors can be invisible to simple allele-vs-reference checks when the allele coincidentally matches the reference at the wrong location.
 
-This pipeline cross-validates every liftOver position against dbSNP and the Ensembl REST API to catch and correct these errors. The result is a high-confidence hg38 coordinate set with ref/alt allele annotation for all 7.36M SBayesRC SNPs.
+Rather than attempt to override these errors (which introduces its own risks), this pipeline takes a **conservative approach**: every SNP in the final output must be independently confirmed by both UCSC liftOver (or dbSNP rescue) and dbSNP, and validated against the hg38 reference FASTA. Any disagreement results in exclusion.
+
+## Inclusion Criteria
+
+Every SNP in the final output (`sbayesrc_hg38.csv`) must satisfy **all three**:
+
+1. **dbSNP match** -- the rsID exists in the current dbSNP release with a matching hg38 chromosome and position
+2. **liftOver agreement** -- if UCSC liftOver succeeded, its hg38 position must equal the dbSNP position. (If liftOver failed but dbSNP has a position, the SNP is included as a "rescue".)
+3. **FASTA confirmation** -- the reference allele that dbSNP reports for the rsID must match the actual hg38 FASTA reference base at that position, and at least one of the SNP's alleles (A1 or A2, accounting for strand) must also match the reference
 
 ## Pipeline
 
-| Step | Source | What it does |
-|------|--------|--------------|
-| 1 | UCSC liftOver | Position-based coordinate conversion using hg19-to-hg38 chain file. Writes 6-column BED to detect strand flips. |
-| 2 | hg38 FASTA | Checks the reference allele at each liftOver position. Flags "suspects" where neither A1 nor A2 matches (possible wrong mapping). |
-| 3 | dbSNP VCF | Cross-validates liftOver positions against [dbSNP](https://www.ncbi.nlm.nih.gov/snp/) (GRCh38). Overrides disagreements, fills liftOver failures. |
-| 4 | Ensembl API | Queries the [Ensembl REST API](https://rest.ensembl.org/) for remaining unmapped SNPs, unresolved suspects, and any unverified liftOver positions in the cache. Overrides when Ensembl disagrees with liftOver. |
-| 5 | hg38 FASTA | Final allele annotation. Complements strand-flipped alleles, determines which allele matches the hg38 reference. |
+### Step 1: UCSC liftOver
 
-### Cascade Logic
+Converts hg19 coordinates to hg38 using the UCSC liftOver tool and the hg19-to-hg38 chain file. Writes a 6-column BED file to detect strand flips from the chain alignment. SNPs that map to a different chromosome are treated as unmapped.
 
-For each SNP, the position source is chosen by priority:
+**Output:** `pos_liftover` for each SNP -- the hg38 position that liftOver produced, or -1 if liftOver failed.
 
-1. If **dbSNP disagrees** with liftOver, use dbSNP (rsID-based mapping is authoritative for segdup regions).
-2. If **Ensembl disagrees** with liftOver (and liftOver wasn't already validated by dbSNP), use Ensembl.
-3. If both dbSNP and Ensembl are unavailable for a SNP, **trust liftOver** (correct >99.99% of the time).
-4. If liftOver failed, use **dbSNP or Ensembl as fallback**.
-5. If no source can map the SNP, mark as **unmapped**.
+### Step 2: dbSNP cross-validation
+
+Compares liftOver positions against dbSNP (GRCh38) using rsID as the join key. Every SNP is classified into one of five statuses:
+
+| Status | Condition | Included in final output? |
+|--------|-----------|:-------------------------:|
+| `confirmed` | liftOver succeeded AND dbSNP agrees on chrom + position | Yes |
+| `rescue` | liftOver failed AND dbSNP has a position for this rsID | Yes (pending FASTA check) |
+| `conflict` | liftOver succeeded AND dbSNP has a **different** position | **No** |
+| `no_dbsnp` | rsID not found in the current dbSNP release | **No** |
+| `unmapped` | liftOver failed AND no dbSNP entry | **No** |
+
+Conflicts are the key safety mechanism: if UCSC and dbSNP disagree on where a SNP is, neither is trusted.
+
+### Step 3: FASTA reference validation
+
+For all `confirmed` and `rescue` SNPs, fetches the hg38 FASTA reference base at the hg38 position and checks:
+
+1. **dbSNP ref vs FASTA ref** -- does the reference allele that dbSNP reports match the actual FASTA base? If not, the SNP is reclassified as `fasta_mismatch` and excluded.
+2. **Allele vs FASTA ref** -- does at least one of the SNP's alleles (A1 or A2, or their strand complements) match the FASTA reference? If not, the SNP is reclassified as `allele_mismatch` and excluded.
+
+### Step 4: Allele annotation
+
+For all SNPs that passed steps 1-3:
+
+- **Strand-flipped liftOver SNPs:** alleles are complemented (A<->T, C<->G) based on the strand flip detected from the chain alignment in step 1
+- **Rescue SNPs:** alleles are complemented if needed to match the FASTA reference strand
+- **Ref/alt determination:** determines whether A1 or A2 matches the hg38 reference
 
 ## Results
 
-| Category | Count |
-|----------|------:|
-| Mapped via liftOver (confirmed by dbSNP) | 7,354,279 |
-| Mapped via dbSNP (override or rescue) | 2,237 |
-| Unmapped (no source resolves) | 2 |
-| **Total** | **7,356,518** |
+*Numbers below are from the most recent pipeline run. Re-run `bash main.sh` to regenerate.*
 
-- **24 liftOver errors corrected** by dbSNP in segmental duplication and HLA regions (1 additional disagreement skipped due to ref mismatch at the dbSNP position)
-- **20 strand-flipped SNPs** complemented (14 detected by liftOver, 6 by FASTA ref check)
-- **0 alleles with "neither" ref match** -- every mapped SNP has A1 or A2 matching the hg38 reference
-- **2 unmapped SNPs**: rs117553620 (chr17) and rs140636911 (chr19)
-- **dbSNP coverage: 99.98%** (7,354,979 / 7,356,518 rsIDs found in the current dbSNP release)
+| Status | Count | In final output? |
+|--------|------:|:-----------------:|
+| `confirmed` | 7,352,740 | Yes |
+| `rescue` | 2,213 | Yes |
+| `conflict` | 25 | No |
+| `no_dbsnp` | 1,538 | No |
+| `unmapped` | 2 | No |
+| `fasta_mismatch` | 0 | No |
+| `allele_mismatch` | 0 | No |
+| **Total input** | **7,356,518** | |
+| **Total in sbayesrc_hg38.csv** | **7,354,953** | |
+
+- **25 conflicts** between UCSC liftOver and dbSNP, all in segmental duplication and HLA regions (chr1 NBPF, chr3, chr6 HLA, chr11). These are discarded.
+- **2,213 rescues** where liftOver failed but dbSNP provides a confirmed position.
+- **1,538 SNPs** have no dbSNP entry (0.02%) and are excluded because they cannot be independently confirmed.
+- **2 unmapped SNPs**: rs117553620 (chr17) and rs140636911 (chr19) -- no source resolves them.
+- **0 FASTA mismatches** -- every included SNP has dbSNP ref matching the hg38 FASTA reference base.
+- **12 strand-flipped SNPs** complemented (9 from liftOver chain alignment, 3 rescue SNPs).
+
+## Logging
+
+Every pipeline run writes a timestamped log file to `logs/` (e.g., `logs/run_20260408_161500.log`). The log captures all console output including per-step SNP counts and the final summary. The `logs/` directory is gitignored.
 
 ## Input
 
@@ -101,7 +138,7 @@ Two output files are produced:
 
 ### `sbayesrc_hg38.csv` (primary output)
 
-Clean, minimal file with one row per successfully mapped SNP:
+Clean, minimal file with one row per SNP that passed all three inclusion criteria:
 
 | Column | Description |
 |--------|-------------|
@@ -113,33 +150,24 @@ Clean, minimal file with one row per successfully mapped SNP:
 
 ### `sbayesrc_liftover_results.csv` (verbose results)
 
-Full liftover details for all 7,356,518 SNPs (including unmapped):
+Full liftover details for all 7,356,518 SNPs (including excluded):
 
 | Column | Description |
 |--------|-------------|
 | chrom | Chromosome |
 | ID | rsID |
 | pos_hg19 | Original hg19 position |
-| pos_hg38 | Lifted hg38 position (-1 if unmapped) |
+| pos_hg38 | Final hg38 position (-1 if excluded) |
+| pos_liftover | Position from UCSC liftOver (-1 if liftOver failed) |
+| pos_dbsnp | Position from dbSNP (-1 if rsID not in dbSNP) |
 | A1, A2 | Original alleles from snp.info |
 | A1_hg38, A2_hg38 | Alleles on the hg38 strand (complemented if strand-flipped) |
-| ref_hg38 | Reference allele at the hg38 position |
-| ref_match | Which allele matches ref: `A1_hg38`, `A2_hg38`, or `neither` |
-| strand_flip | Whether alleles were complemented (strand flip detected) |
-| method | Position source: `liftover`, `dbsnp`, `ensembl`, or empty (unmapped) |
+| dbsnp_ref | Reference allele reported by dbSNP (empty if no dbSNP entry) |
+| fasta_ref | Actual hg38 FASTA reference base at pos_hg38 (empty if excluded) |
+| ref_match | Which allele matches ref: `A1_hg38` or `A2_hg38` (empty if excluded) |
+| strand_flip | Whether alleles were complemented |
+| status | SNP classification (see [Step 2](#step-2-dbsnp-cross-validation) and [Step 3](#step-3-fasta-reference-validation)) |
 | Index, GenPos, A1Freq, N, Block | Preserved from snp.info |
-
-Both files are also checked into `outputs/` so results are available directly from the repository without running the pipeline.
-
-## Exhaustive Ensembl Validation
-
-By default, the pipeline queries Ensembl only for high-priority SNPs (unmapped + FASTA suspects). To cross-validate all liftOver positions that lack dbSNP confirmation:
-
-```bash
-ENSEMBL_FULL=1 bash main.sh
-```
-
-This queries remaining rsIDs through the Ensembl REST API (~3-4 hours, cached in `tmp/ensembl_cache.json`). Subsequent runs apply cached results instantly.
 
 ## Runtime and Storage
 
@@ -151,18 +179,15 @@ This queries remaining rsIDs through the Ensembl REST API (~3-4 hours, cached in
 |------|-------------|---------|
 | 0 | Setup (download tools, FASTA, chain file, dbSNP VCF) | ~30 min first run, <1 s cached |
 | 0b | Build dbSNP lookup from VCF (first run only) | ~15-30 min |
-| 1 | UCSC liftOver (7.36M SNPs) | 37 s |
-| 2 | FASTA ref check (flag suspects) | 9 s |
-| 3 | dbSNP cross-validation | 9 s |
-| 4 | Ensembl cross-validation (high-priority only) | 12 s |
-| 5 | Allele annotation (FASTA query + complement) | 7 s |
-| -- | Write output CSVs | 19 s |
+| 1 | UCSC liftOver (7.36M SNPs) | ~40 s |
+| 2 | dbSNP cross-validation | ~10 s |
+| 3 | FASTA reference validation | ~10 s |
+| 4 | Allele annotation | ~10 s |
+| -- | Write output CSVs | ~20 s |
 
 **Total pipeline runtime: ~100 seconds** (cached run, all reference files present).
 
 First-run download time depends on network speed. The dbSNP VCF (~28 GB) and hg38 FASTA (~900 MB) are the largest downloads. The dbSNP lookup extraction streams the full VCF once (~15-30 min) and is cached for subsequent runs.
-
-With `ENSEMBL_FULL=1`, Step 4 queries additional rsIDs via the Ensembl REST API, adding ~3-4 hours (also cached).
 
 ### Storage
 
@@ -174,16 +199,16 @@ With `ENSEMBL_FULL=1`, Step 4 queries additional rsIDs via the Ensembl REST API,
 | `tools/venv/` | ~100 MB | Python virtual environment |
 | `tools/bin/liftOver` | 24 MB | UCSC liftOver binary |
 | `tools/hg19ToHg38.over.chain.gz` | 224 KB | hg19-to-hg38 chain file |
-| `tmp/` | 502 MB | Intermediate BED files + Ensembl cache |
+| `tmp/` | ~250 MB | Intermediate BED files |
 | **Total** | **~5 GB** | |
 
-On first run, the dbSNP VCF (~28 GB) is **streamed directly** from NCBI FTP and decompressed on the fly — only the small lookup TSV (185 MB) is saved to disk. The hg38 FASTA (~900 MB compressed) is downloaded and decompressed. All files are cached in `tools/` and reused on subsequent runs.
+On first run, the dbSNP VCF (~28 GB) is **streamed directly** from NCBI FTP and decompressed on the fly -- only the small lookup TSV (185 MB) is saved to disk. The hg38 FASTA (~900 MB compressed) is downloaded and decompressed. All files are cached in `tools/` and reused on subsequent runs.
 
 ## Directory Structure
 
 ```
 .
-├── main.sh                     Entry point (venv setup + run)
+├── main.sh                     Entry point (venv setup + logging + run)
 ├── liftover.py                 Pipeline (single file, self-contained)
 ├── requirements.txt            Python dependencies (pandas, pysam)
 ├── snp.info                    Input: SBayesRC SNPs, hg19 (downloaded from GitHub Release)
@@ -194,9 +219,7 @@ On first run, the dbSNP VCF (~28 GB) is **streamed directly** from NCBI FTP and 
 │   └── workflows/
 │       └── docker-publish.yml  Builds and publishes Docker image to GHCR
 ├── README.md
-├── outputs/                    Pipeline outputs (available as GitHub Release assets)
-│   ├── sbayesrc_hg38.csv       Clean hg38 coordinates (chrom, pos, ref, alt, rsid)
-│   └── sbayesrc_liftover_results.csv  Verbose liftover details
+├── logs/                       Timestamped run logs (gitignored)
 ├── tools/                      Downloaded reference files (gitignored)
 │   ├── bin/liftOver            UCSC liftOver binary
 │   ├── venv/                   Python virtual environment
@@ -205,8 +228,7 @@ On first run, the dbSNP VCF (~28 GB) is **streamed directly** from NCBI FTP and 
 │   ├── hg38.fa.fai             FASTA index (created by pysam)
 │   └── dbsnp_lookup.tsv        rsID-to-position table (streamed from dbSNP VCF)
 └── tmp/                        Intermediate files (gitignored)
-    ├── ensembl_cache.json      Cached Ensembl API results
-    └── *.bed, *.txt            Temporary liftOver files
+    └── *.bed                   Temporary liftOver files
 ```
 
 ## Requirements
@@ -216,9 +238,9 @@ On first run, the dbSNP VCF (~28 GB) is **streamed directly** from NCBI FTP and 
 
 ## Known Limitations
 
-- **~1,540 SNPs have no dbSNP entry** in the current release (0.02% of 7.36M). These rely solely on liftOver positions. Use `ENSEMBL_FULL=1` to cross-validate them via the Ensembl API.
+- **~1,540 SNPs have no dbSNP entry** in the current release (0.02% of 7.36M). These are excluded from the final output (`no_dbsnp` status) because they cannot be independently confirmed.
 - **Strand-ambiguous SNPs (A/T, C/G):** Strand flips are detected from the chain alignment, not from alleles. For A/T and C/G SNPs, complementing swaps labels but not nucleotides. This is correct but may look surprising in the output.
-- **2 unmapped SNPs** cannot be resolved by any source (liftOver, dbSNP, or Ensembl).
+- **dbSNP `latest_release`:** The pipeline streams from NCBI's `latest_release` URL, so the dbSNP version changes when NCBI publishes updates. The cached `dbsnp_lookup.tsv` is not automatically refreshed -- delete it to re-stream from the latest release.
 
 ## Data Sources
 
@@ -226,5 +248,4 @@ On first run, the dbSNP VCF (~28 GB) is **streamed directly** from NCBI FTP and 
 - **hg19-to-hg38 chain file**: https://hgdownload.soe.ucsc.edu/goldenPath/hg19/liftOver/
 - **GRCh38 reference FASTA**: https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/
 - **dbSNP VCF**: https://ftp.ncbi.nlm.nih.gov/snp/latest_release/VCF/
-- **Ensembl REST API**: https://rest.ensembl.org/
 - **SBayesRC**: https://github.com/zhilizheng/SBayesRC

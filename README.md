@@ -2,7 +2,44 @@
 
 Reproducible pipeline to lift the [SBayesRC](https://github.com/zhilizheng/SBayesRC) `snp.info` file (7,356,518 SNPs, autosomes 1-22) from GRCh37/hg19 to GRCh38/hg38.
 
-## Quick Start
+## Download Pre-Built Output Files
+
+**No pipeline run required.** Download the output files directly:
+
+- [**`sbayesrc_hg38.csv`**](https://github.com/jesseICR/sbayesrc-liftover/releases/download/v1.0/sbayesrc_hg38.csv) (184 MB) -- 7,354,747 SNPs, 5 columns: chrom, pos, ref, alt, rsid
+- [**`sbayesrc_liftover_results.csv`**](https://github.com/jesseICR/sbayesrc-liftover/releases/download/v1.0/sbayesrc_liftover_results.csv) (893 MB) -- all 7,356,518 input SNPs with full annotation and QC status
+
+The input file is also available: [`snp.info`](https://github.com/jesseICR/sbayesrc-liftover/releases/download/v1.0/snp.info) (380 MB). See all assets on the [Releases](https://github.com/jesseICR/sbayesrc-liftover/releases) page.
+
+### `sbayesrc_hg38.csv` (primary output)
+
+One row per SNP that passed all QC checks. This is the file most users need.
+
+| chrom | pos | ref | alt | rsid |
+|------:|--------:|:---:|:---:|:-------------|
+| 1 | 866281 | C | T | rs12132974 |
+| 1 | 866300 | A | C | rs12134490 |
+| 1 | 866478 | C | T | rs17276806 |
+| 1 | 867476 | C | T | rs139867617 |
+| 1 | 869379 | C | T | rs7526310 |
+
+### `sbayesrc_liftover_results.csv` (verbose results)
+
+One row per input SNP, including excluded SNPs with their exclusion reason. Useful for auditing.
+
+| chrom | ID | pos_hg19 | pos_hg38 | pos_liftover | pos_dbsnp | A1 | A2 | A1_hg38 | A2_hg38 | status | a1_freq_kg | ... |
+|------:|:------------|--------:|--------:|--------:|--------:|:--:|:--:|:-------:|:-------:|:----------|--------:|:---:|
+| 1 | rs12132974 | 801661 | 866281 | 866281 | 866281 | T | C | T | C | confirmed | 0.074 | ... |
+| 1 | rs12134490 | 801680 | 866300 | 866300 | 866300 | C | A | C | A | confirmed | 0.074 | ... |
+| 1 | rs17276806 | 801858 | 866478 | 866478 | 866478 | T | C | T | C | confirmed | 0.074 | ... |
+| 1 | rs139867617 | 802856 | 867476 | 867476 | 867476 | T | C | T | C | confirmed | 0.074 | ... |
+| 1 | rs7526310 | 804759 | 869379 | 869379 | 869379 | T | C | T | C | confirmed | 0.124 | ... |
+
+Full column descriptions are in the [Output](#output) section below.
+
+---
+
+## Quick Start (run the pipeline yourself)
 
 ```bash
 # Requirements: Python 3.10+, curl
@@ -10,8 +47,6 @@ bash main.sh
 ```
 
 The script creates a virtual environment, installs dependencies, downloads all reference files on first run, and produces the output. Everything is stored inside the repo directory (`tools/`, `tmp/`). Delete the repo and there is zero trace left on your system.
-
-Pre-built output files are also available as [GitHub Release](https://github.com/jesseICR/sbayesrc-liftover/releases) assets -- no pipeline run required.
 
 ### Docker
 

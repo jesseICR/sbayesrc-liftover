@@ -381,48 +381,39 @@ def step_fasta_validation(df):
 
     # Check 3: the non-ref allele must appear in dbSNP's alt allele(s).
     #
-    # First we figure out which strand we're on by seeing which allele
-    # (A1/A2 or their complement) matched the FASTA ref in check 2.
-    # The OTHER allele on that same strand is the non-ref allele.
-    # That non-ref allele must exist in dbSNP's comma-separated alt list.
+    # We know from check 2 which strand this SNP is on: if A1 or A2
+    # matches the FASTA ref directly, it's forward strand; if complement(A1)
+    # or complement(A2) matches, it's reverse strand. The OTHER allele on
+    # that same strand is the non-ref allele, and it must be in dbSNP's alts.
     #
-    # Example (forward strand): A1=C matches ref, so A2=T is the non-ref.
-    #   Check T is in dbSNP alts.
-    # Example (reverse strand): complement(A1)=G matches ref, so
-    #   complement(A2)=A is the non-ref. Check A is in dbSNP alts.
+    # Example (forward): A1=C matches ref → non-ref is A2=T → check T in dbSNP alts.
+    # Example (reverse): comp(A1)=G matches ref → non-ref is comp(A2)=A → check A in dbSNP alts.
     still_ok = df["status"].isin(["confirmed", "rescue"])
-    dbsnp_alt_sets = df["dbsnp_alt"].str.split(",")
 
-    def _alt_in_dbsnp(row):
+    def _find_non_ref_allele(a1, a2, ref):
+        """Given A1, A2, and the FASTA ref, return the non-ref allele
+        on whichever strand matches the ref."""
+        a1c, a2c = COMPLEMENT.get(a1, ""), COMPLEMENT.get(a2, "")
+        if   a1  == ref: return a2      # forward strand
+        elif a2  == ref: return a1      # forward strand
+        elif a1c == ref: return a2c     # reverse strand
+        elif a2c == ref: return a1c     # reverse strand
+        return None                     # shouldn't happen after check 2
+
+    def _check_alt(row):
         if not row["_still_ok"]:
-            return True  # skip already-excluded rows
+            return True
         alts = row["_dbsnp_alts"]
         if not isinstance(alts, list):
             return False
-        ref = row["fasta_ref"]
-        a1, a2 = row["A1"], row["A2"]
-        a1c = COMPLEMENT.get(a1, "")
-        a2c = COMPLEMENT.get(a2, "")
-        # Identify which strand, then pick the non-ref allele on that strand
-        if a1 == ref:
-            non_ref = a2          # forward strand: A2 is alt
-        elif a2 == ref:
-            non_ref = a1          # forward strand: A1 is alt
-        elif a1c == ref:
-            non_ref = a2c         # reverse strand: complement(A2) is alt
-        elif a2c == ref:
-            non_ref = a1c         # reverse strand: complement(A1) is alt
-        else:
-            return False          # shouldn't happen -- check 2 already verified
-        return non_ref in alts
+        non_ref = _find_non_ref_allele(row["A1"], row["A2"], row["fasta_ref"])
+        return non_ref is not None and non_ref in alts
 
     check_df = pd.DataFrame({
-        "A1": df["A1"], "A2": df["A2"],
-        "fasta_ref": df["fasta_ref"],
-        "_dbsnp_alts": dbsnp_alt_sets,
-        "_still_ok": still_ok,
+        "A1": df["A1"], "A2": df["A2"], "fasta_ref": df["fasta_ref"],
+        "_dbsnp_alts": df["dbsnp_alt"].str.split(","), "_still_ok": still_ok,
     })
-    alt_ok = check_df.apply(_alt_in_dbsnp, axis=1)
+    alt_ok = check_df.apply(_check_alt, axis=1)
     alt_mismatch = still_ok & ~alt_ok
     n_alt_mismatch = alt_mismatch.sum()
     df.loc[alt_mismatch, "status"] = "alt_mismatch"
@@ -456,20 +447,24 @@ def step_annotate(df):
         df.loc[lo_flip, "A2_hg38"] = df.loc[lo_flip, "A2"].map(COMPLEMENT)
         print(f"  Complemented {lo_flip.sum()} strand-flipped liftOver SNPs")
 
-    # Rescue SNPs: complement if needed (alleles may be on opposite strand)
+    # Rescue SNPs: complement if neither allele matches ref on the forward
+    # strand, but the complement of one allele does match.
     rescue = passed & (df["status"] == "rescue")
     if rescue.any():
-        sub = df.loc[rescue]
         ref = df.loc[rescue, "fasta_ref"]
-        no_match = (sub["A1"] != ref) & (sub["A2"] != ref)
-        comp_ok  = (sub["A1"].map(COMPLEMENT) == ref) | \
-                   (sub["A2"].map(COMPLEMENT) == ref)
-        needs = rescue & df.index.isin(sub.index[no_match & comp_ok])
-        if needs.any():
-            df.loc[needs, "A1_hg38"] = df.loc[needs, "A1"].map(COMPLEMENT)
-            df.loc[needs, "A2_hg38"] = df.loc[needs, "A2"].map(COMPLEMENT)
-            df.loc[needs, "strand_flip"] = True
-            print(f"  Complemented {needs.sum()} rescue SNPs")
+        a1  = df.loc[rescue, "A1"]
+        a2  = df.loc[rescue, "A2"]
+        forward_matches_ref = (a1 == ref) | (a2 == ref)
+        complement_matches_ref = (a1.map(COMPLEMENT) == ref) | (a2.map(COMPLEMENT) == ref)
+        needs_complement = pd.Series(False, index=df.index)
+        needs_complement.loc[rescue[rescue].index] = (
+            (~forward_matches_ref & complement_matches_ref).values
+        )
+        if needs_complement.any():
+            df.loc[needs_complement, "A1_hg38"] = df.loc[needs_complement, "A1"].map(COMPLEMENT)
+            df.loc[needs_complement, "A2_hg38"] = df.loc[needs_complement, "A2"].map(COMPLEMENT)
+            df.loc[needs_complement, "strand_flip"] = True
+            print(f"  Complemented {needs_complement.sum()} rescue SNPs")
 
     # Determine which allele matches ref
     df["ref_match"] = ""
@@ -591,13 +586,15 @@ def _make_freq_plot(df, path):
     y = df["a1_freq_kg"].values
 
     fig, ax = plt.subplots(figsize=(8, 8))
-    ax.scatter(x, y, s=0.1, alpha=0.05, rasterized=True)
-    ax.plot([0, 1], [0, 1], "r--", linewidth=1, alpha=0.5)
+    ax.scatter(x, y, s=0.1, alpha=0.05, color="black", rasterized=True)
+    ax.plot([0, 1], [0, 1], "r-", linewidth=1, alpha=0.5)
     ax.set_xlabel("A1 freq (SBayesRC snp.info)")
     ax.set_ylabel("A1 freq (1000G EUR unrelated)")
     ax.set_title(f"Allele frequency validation (n={len(df):,})")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_xticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
     ax.set_aspect("equal")
     fig.tight_layout()
     fig.savefig(path, dpi=150)

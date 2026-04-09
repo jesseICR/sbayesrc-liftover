@@ -514,10 +514,17 @@ def step_kg_validation(df):
         "alt": "_snp_alt",
         "af_eur_unrel": "kg_af",
     })[["ID", "chrom", "pos_hg38", "fasta_ref", "_snp_alt", "kg_af"]]
+    # Filter to autosomal chromosomes (build_kg_lookup doesn't filter by chrom,
+    # unlike build_dbsnp_lookup which uses REFSEQ_TO_CHROM). Non-numeric chroms
+    # like X/Y/MT would crash the astype(int) below.
+    autosomal = kg_merge["chrom"].str.fullmatch(r"\d+")
+    kg_merge = kg_merge[autosomal]
     kg_merge["chrom"] = kg_merge["chrom"].astype(int)
     kg_merge["pos_hg38"] = kg_merge["pos_hg38"].astype(int)
-    df = df.merge(kg_merge, on=["ID", "chrom", "pos_hg38", "fasta_ref", "_snp_alt"],
-                  how="left")
+    # Deduplicate to prevent the left merge from inflating df with duplicate rows
+    merge_keys = ["ID", "chrom", "pos_hg38", "fasta_ref", "_snp_alt"]
+    kg_merge = kg_merge.drop_duplicates(subset=merge_keys)
+    df = df.merge(kg_merge, on=merge_keys, how="left")
 
     in_kg = passed & df["kg_af"].notna()
     not_in_kg = passed & df["kg_af"].isna()
@@ -679,11 +686,11 @@ def main():
     dup_mask = passed & df.duplicated(subset=["chrom", "pos_hg38"], keep=False)
     n_dup = dup_mask.sum()
     if n_dup > 0:
-        df.loc[dup_mask, "status"] = "duplicate_pos"
-        df.loc[dup_mask, "pos_hg38"] = -1
         print(f"\n  Duplicate chrom+pos excluded: {n_dup:,}")
         for _, r in df.loc[dup_mask, ["ID", "chrom", "pos_hg38"]].head(20).iterrows():
             print(f"    {r.ID}  chr{r.chrom}:{int(r.pos_hg38)}")
+        df.loc[dup_mask, "status"] = "duplicate_pos"
+        df.loc[dup_mask, "pos_hg38"] = -1
     else:
         print(f"\n  No duplicate chrom+pos among passed SNPs")
 

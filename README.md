@@ -272,6 +272,13 @@ One row per input SNP (7,356,518 rows), including excluded SNPs:
 | a1_freq_kg | Frequency of A1 in 1000G EUR unrelated (`NaN` if not matched in 1000G) |
 | Index, GenPos, A1Freq, N, Block | Preserved from snp.info |
 
+To verify your downloads, run `sha256sum` and confirm the hashes match:
+
+```
+4881418283f88be72ef61ab0e96f9772922ae8143feb3d448ab6441717a38994  sbayesrc_hg38.csv
+0b0642cc544e97c52f49f41acd4fe44d4e8eca3041d0b832fbe0e2c442f38eb7  sbayesrc_liftover_results.csv
+```
+
 ### `kg_validation/allele_freq_validation.png` and `bland_altman.png`
 
 Scatter plot and Bland-Altman plot of SBayesRC A1 frequency vs 1000G EUR A1 frequency. Only SNPs that passed the frequency filter are plotted.

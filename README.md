@@ -227,6 +227,12 @@ The canonical SBayesRC `snp.info` file (tab-delimited):
 | N | Sample size |
 | Block | LD block |
 
+To verify your copy is identical to the one used in this pipeline, run `sha256sum snp.info` and confirm the hash matches:
+
+```
+7bd871fbdd3044595c5e3acba064095f3c7d7b275b23cbca1813665915f8a61e  snp.info
+```
+
 ## Output
 
 Three output files are produced:

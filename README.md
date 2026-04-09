@@ -35,7 +35,7 @@ Run (mount the repo directory so downloads persist and output is accessible):
 docker run --rm -v $(pwd):/data ghcr.io/jesseicr/sbayesrc-liftover:latest
 ```
 
-The ~5 GB of downloaded reference files are cached in `tools/` and reused on subsequent runs.
+The ~8 GB of downloaded reference files are cached in `tools/` and reused on subsequent runs.
 
 ## Why This Exists
 
@@ -45,11 +45,13 @@ Rather than attempt to override these errors (which introduces its own risks), t
 
 ## Inclusion Criteria
 
-Every SNP in the final output (`sbayesrc_hg38.csv`) must satisfy **all three**:
+Every SNP in the final output (`sbayesrc_hg38.csv`) must satisfy **all five**:
 
 1. **dbSNP match** -- the rsID exists in the current dbSNP release with a matching hg38 chromosome and position
 2. **liftOver agreement** -- if UCSC liftOver succeeded, its hg38 position must equal the dbSNP position. (If liftOver failed but dbSNP has a position, the SNP is included as a "rescue".)
-3. **FASTA confirmation** -- the reference allele that dbSNP reports for the rsID must match the actual hg38 FASTA reference base at that position, and at least one of the SNP's alleles (A1 or A2, accounting for strand) must also match the reference
+3. **dbSNP ref = FASTA ref** -- the reference allele that dbSNP reports for the rsID must match the actual hg38 FASTA reference base at that position
+4. **Allele matches reference** -- at least one of the SNP's alleles (A1 or A2, accounting for strand) must match the hg38 FASTA reference base
+5. **Alt allele in dbSNP** -- the other (non-reference) allele must appear in dbSNP's alt allele(s) for that rsID. This catches cases where the SNP's alleles are individually valid but don't correspond to the variant dbSNP has on file.
 
 ## Pipeline
 
@@ -75,10 +77,11 @@ Conflicts are the key safety mechanism: if UCSC and dbSNP disagree on where a SN
 
 ### Step 3: FASTA reference validation
 
-For all `confirmed` and `rescue` SNPs, fetches the hg38 FASTA reference base at the hg38 position and checks:
+For all `confirmed` and `rescue` SNPs, fetches the hg38 FASTA reference base at the hg38 position and runs three checks:
 
 1. **dbSNP ref vs FASTA ref** -- does the reference allele that dbSNP reports match the actual FASTA base? If not, the SNP is reclassified as `fasta_mismatch` and excluded.
 2. **Allele vs FASTA ref** -- does at least one of the SNP's alleles (A1 or A2, or their strand complements) match the FASTA reference? If not, the SNP is reclassified as `allele_mismatch` and excluded.
+3. **Alt allele in dbSNP** -- whichever allele is NOT the reference (on the matching strand) must appear in dbSNP's alt allele(s) for that rsID. dbSNP may list multiple alts for multi-allelic sites (e.g., `A,G`); the non-ref allele must be one of them. If not, the SNP is reclassified as `alt_mismatch` and excluded.
 
 ### Step 4: Allele annotation
 
@@ -92,13 +95,14 @@ For all SNPs that passed steps 1-3:
 
 Compares allele frequencies against 1000 Genomes European unrelated samples as a final sanity check on the liftover. The 1000G pvar file contains pre-computed `AF_EUR_unrel` values, so no genotype processing or sample filtering is needed.
 
-For each included SNP found in 1000G, the pipeline:
-1. Matches by rsID and verifies chrom/pos agreement
-2. Aligns A1 (effect allele) to the 1000G ref/alt. For strand-ambiguous SNPs (A/T, C/G), frequency-based alignment is used.
-3. Computes `a1_freq_kg` (frequency of A1 in 1000G EUR unrelated)
-4. Flags rsIDs with |A1Freq - a1_freq_kg| > 0.2
-5. Reports rsIDs not found in 1000G
-6. Generates a scatter plot (`allele_freq_validation.png`)
+Both the pipeline output and the 1000G pvar are on the hg38 forward strand, so allele matching is done by exact identity -- no strand complement logic is needed. For multi-allelic sites in 1000G (multiple rows per rsID with different alt alleles), the pipeline matches on rsID + chrom + pos + ref + alt to pick the correct row.
+
+For each included SNP, the pipeline:
+1. Matches by rsID, chrom, pos, ref, and alt against 1000G
+2. Computes `a1_freq_kg` (frequency of A1 in 1000G EUR unrelated)
+3. Flags rsIDs with |A1Freq - a1_freq_kg| > 0.2
+4. Reports rsIDs not found in 1000G (rsID missing or allele mismatch)
+5. Generates a scatter plot (`kg_validation/allele_freq_validation.png`)
 
 ## Results
 
@@ -113,6 +117,7 @@ For each included SNP found in 1000G, the pipeline:
 | `unmapped` | 2 | No |
 | `fasta_mismatch` | 0 | No |
 | `allele_mismatch` | 0 | No |
+| `alt_mismatch` | 0 | No |
 | **Total input** | **7,356,518** | |
 | **Total in sbayesrc_hg38.csv** | **7,354,953** | |
 
@@ -121,8 +126,15 @@ For each included SNP found in 1000G, the pipeline:
 - **1,538 SNPs** have no dbSNP entry (0.02%) and are excluded because they cannot be independently confirmed.
 - **2 unmapped SNPs**: rs117553620 (chr17) and rs140636911 (chr19) -- no source resolves them.
 - **0 FASTA mismatches** -- every included SNP has dbSNP ref matching the hg38 FASTA reference base.
+- **0 alt mismatches** -- every included SNP's non-ref allele appears in dbSNP's alt allele(s).
 - **12 strand-flipped SNPs** complemented (9 from liftOver chain alignment, 3 rescue SNPs).
-- **1000G validation**: 7,333,424 SNPs allele-aligned with 1000G EUR (1,092,122 strand-ambiguous resolved via frequency), 13,075 with |freq diff| > 0.2, 13,206 not found in 1000G, 8,323 allele mismatches.
+- **1000G validation**: 7,341,622 SNPs matched with 1000G EUR by exact allele identity, 206 with |freq diff| > 0.2. Of 7,354,953 included SNPs: 13,206 rsIDs not found in 1000G, 125 allele mismatches (rsID exists but ref/alt don't match) -- total 13,331 without a `a1_freq_kg` value.
+
+### 1000G allele frequency scatter plot
+
+![Allele frequency validation](kg_validation/allele_freq_validation.png)
+
+Scatter plot of SBayesRC A1 frequency (x-axis) vs 1000G EUR A1 frequency (y-axis) for the 7,341,622 SNPs with valid frequency data. SNPs not found in 1000G (13,206) and allele mismatches (125) are excluded from this plot -- they are not plotted at frequency 0.
 
 ## Logging
 
@@ -147,11 +159,11 @@ The canonical SBayesRC `snp.info` file (tab-delimited):
 
 ## Output
 
-Two output files are produced:
+Three output files are produced:
 
 ### `sbayesrc_hg38.csv` (primary output)
 
-Clean, minimal file with one row per SNP that passed all three inclusion criteria:
+Clean, minimal file with one row per SNP that passed all five inclusion criteria:
 
 | Column | Description |
 |--------|-------------|
@@ -183,6 +195,10 @@ Full liftover details for all 7,356,518 SNPs (including excluded):
 | status | SNP classification (see [Step 2](#step-2-dbsnp-cross-validation) and [Step 3](#step-3-fasta-reference-validation)) |
 | a1_freq_kg | Frequency of A1 in 1000G EUR unrelated (NaN if not found or allele mismatch) |
 | Index, GenPos, A1Freq, N, Block | Preserved from snp.info |
+
+### `kg_validation/allele_freq_validation.png`
+
+Scatter plot of SBayesRC A1 frequency vs 1000G EUR A1 frequency for all matched SNPs. See [1000G allele frequency scatter plot](#1000g-allele-frequency-scatter-plot).
 
 ## Runtime and Storage
 
@@ -221,7 +237,7 @@ First-run download time depends on network speed. The dbSNP VCF (~28 GB), hg38 F
 | `tmp/` | ~250 MB | Intermediate BED files |
 | **Total** | **~8 GB** | |
 
-On first run, the dbSNP VCF (~28 GB) is **streamed directly** from NCBI FTP and decompressed on the fly -- only the small lookup TSV (185 MB) is saved to disk. The hg38 FASTA (~900 MB compressed) is downloaded and decompressed. All files are cached in `tools/` and reused on subsequent runs.
+On first run, the dbSNP VCF (~28 GB) is **streamed directly** from NCBI FTP and decompressed on the fly -- only the small lookup TSV (~193 MB) is saved to disk. The hg38 FASTA (~900 MB compressed) is downloaded and decompressed. All files are cached in `tools/` and reused on subsequent runs.
 
 ## Directory Structure
 
@@ -229,7 +245,7 @@ On first run, the dbSNP VCF (~28 GB) is **streamed directly** from NCBI FTP and 
 .
 ├── main.sh                     Entry point (venv setup + logging + run)
 ├── liftover.py                 Pipeline (single file, self-contained)
-├── requirements.txt            Python dependencies (pandas, pysam)
+├── requirements.txt            Python dependencies (pandas, pysam, zstandard, matplotlib)
 ├── snp.info                    Input: SBayesRC SNPs, hg19 (downloaded from GitHub Release)
 ├── Dockerfile
 ├── .dockerignore
@@ -239,13 +255,17 @@ On first run, the dbSNP VCF (~28 GB) is **streamed directly** from NCBI FTP and 
 │       └── docker-publish.yml  Builds and publishes Docker image to GHCR
 ├── README.md
 ├── logs/                       Timestamped run logs (gitignored)
+├── kg_validation/              1000G validation output (git-tracked)
+│   └── allele_freq_validation.png  Scatter plot of A1 freq vs 1000G EUR freq
 ├── tools/                      Downloaded reference files (gitignored)
 │   ├── bin/liftOver            UCSC liftOver binary
 │   ├── venv/                   Python virtual environment
 │   ├── hg19ToHg38.over.chain.gz
 │   ├── hg38.fa                 GRCh38 reference FASTA
 │   ├── hg38.fa.fai             FASTA index (created by pysam)
-│   └── dbsnp_lookup.tsv        rsID-to-position table (streamed from dbSNP VCF)
+│   ├── dbsnp_lookup.tsv        rsID-to-position table (streamed from dbSNP VCF)
+│   ├── kg_all.pvar.zst         1000 Genomes pvar (zstd-compressed)
+│   └── kg_eur_lookup.tsv       rsID-to-EUR-AF table (streamed from pvar)
 └── tmp/                        Intermediate files (gitignored)
     └── *.bed                   Temporary liftOver files
 ```

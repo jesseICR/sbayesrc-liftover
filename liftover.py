@@ -3,15 +3,18 @@
 liftover.py  --  Lift SBayesRC snp.info from hg19 (GRCh37) to hg38 (GRCh38).
 
 Pipeline:
-  1. UCSC liftOver           position-based coordinate conversion
+  1. UCSC liftOver           position-based coordinate conversion (hg19 -> hg38)
   2. dbSNP cross-validation  confirm liftOver positions, rescue failures, discard conflicts
-  3. FASTA reference check   verify dbSNP ref matches hg38 FASTA at each position
+  3. FASTA reference check   verify ref/alt alleles against hg38 FASTA and dbSNP
   4. Allele annotation       strand complement + ref/alt determination
+  5. 1000G EUR validation    compare allele frequencies against 1000 Genomes (informational)
 
-Every SNP in the final output (sbayesrc_hg38.csv) must satisfy ALL of:
+Inclusion criteria -- every SNP in sbayesrc_hg38.csv must satisfy ALL of:
   1. Its rsID exists in dbSNP with a matching hg38 chrom and position
   2. If UCSC liftOver succeeded, the liftOver position must equal the dbSNP position
   3. The dbSNP reference allele must match the hg38 FASTA reference base
+  4. At least one allele (A1/A2, accounting for strand) must match the FASTA ref
+  5. The other (non-ref) allele must appear in dbSNP's alt allele(s) for that rsID
 
 Usage:
     bash main.sh
@@ -19,6 +22,7 @@ Usage:
 Input:  snp.info   (SBayesRC tab-delimited, hg19 coordinates)
 Output: sbayesrc_hg38.csv              (clean: chrom, pos, ref, alt, rsid)
         sbayesrc_liftover_results.csv  (verbose: all columns, all SNPs)
+        kg_validation/allele_freq_validation.png  (1000G frequency scatter plot)
 """
 import gzip
 import io
@@ -129,7 +133,10 @@ def setup():
 def build_dbsnp_lookup(rsid_set):
     """Stream dbSNP VCF directly from NCBI FTP, extracting rows that match our rsIDs.
     The full 28 GB VCF is streamed and decompressed on the fly -- only the small
-    lookup TSV (~200 MB) is saved to disk."""
+    lookup TSV (~200 MB) is saved to disk.
+
+    Stores the full comma-separated ALT field (e.g. "A,G" for multi-allelic sites)
+    so that the alt allele check in step 3 can verify against all possible alts."""
     if os.path.isfile(DBSNP_TSV):
         print("  [skip] dbSNP lookup table", flush=True)
         return
@@ -372,15 +379,23 @@ def step_fasta_validation(df):
     df.loc[allele_mismatch, "status"] = "allele_mismatch"
     df.loc[allele_mismatch, "pos_hg38"] = -1
 
-    # Check 3: the non-ref allele must appear in dbSNP's alt allele(s)
+    # Check 3: the non-ref allele must appear in dbSNP's alt allele(s).
+    #
+    # First we figure out which strand we're on by seeing which allele
+    # (A1/A2 or their complement) matched the FASTA ref in check 2.
+    # The OTHER allele on that same strand is the non-ref allele.
+    # That non-ref allele must exist in dbSNP's comma-separated alt list.
+    #
+    # Example (forward strand): A1=C matches ref, so A2=T is the non-ref.
+    #   Check T is in dbSNP alts.
+    # Example (reverse strand): complement(A1)=G matches ref, so
+    #   complement(A2)=A is the non-ref. Check A is in dbSNP alts.
     still_ok = df["status"].isin(["confirmed", "rescue"])
-    # Determine which allele is NOT the ref (i.e. the alt) -- check both orientations
-    # dbsnp_alt may be comma-separated (multi-allelic sites)
     dbsnp_alt_sets = df["dbsnp_alt"].str.split(",")
 
     def _alt_in_dbsnp(row):
         if not row["_still_ok"]:
-            return True  # skip non-checkable rows
+            return True  # skip already-excluded rows
         alts = row["_dbsnp_alts"]
         if not isinstance(alts, list):
             return False
@@ -388,18 +403,17 @@ def step_fasta_validation(df):
         a1, a2 = row["A1"], row["A2"]
         a1c = COMPLEMENT.get(a1, "")
         a2c = COMPLEMENT.get(a2, "")
-        # Determine which strand we're on, then the OTHER allele on that
-        # strand is the non-ref allele to check against dbSNP alts.
+        # Identify which strand, then pick the non-ref allele on that strand
         if a1 == ref:
-            non_ref = a2
+            non_ref = a2          # forward strand: A2 is alt
         elif a2 == ref:
-            non_ref = a1
+            non_ref = a1          # forward strand: A1 is alt
         elif a1c == ref:
-            non_ref = a2c
+            non_ref = a2c         # reverse strand: complement(A2) is alt
         elif a2c == ref:
-            non_ref = a1c
+            non_ref = a1c         # reverse strand: complement(A1) is alt
         else:
-            return False  # shouldn't happen -- check 2 already verified
+            return False          # shouldn't happen -- check 2 already verified
         return non_ref in alts
 
     check_df = pd.DataFrame({
@@ -471,81 +485,67 @@ def step_annotate(df):
 # Step 5: 1000G EUR allele frequency validation
 # ---------------------------------------------------------------------------
 def step_kg_validation(df):
+    """Compare allele frequencies against 1000 Genomes EUR as a sanity check.
+
+    Both our data (A1_hg38/A2_hg38) and the 1000G pvar are on the hg38
+    forward strand, so we match by exact allele identity -- no strand
+    complement logic is needed. For multi-allelic sites in 1000G (multiple
+    rows per rsID), this naturally picks the row with the matching alt.
+    """
     print(f"\n[Step 5] 1000G EUR allele frequency validation", flush=True)
 
     kg = pd.read_csv(KG_LOOKUP_TSV, sep="\t", dtype={"chrom": str, "pos": int})
     print(f"  Loaded {len(kg):,} 1000G entries")
 
-    kg_dedup = (
-        kg.drop_duplicates("rsid")
-        .rename(columns={
-            "rsid": "ID",
-            "chrom": "kg_chrom",
-            "pos": "kg_pos",
-            "ref": "kg_ref",
-            "alt": "kg_alt",
-            "af_eur_unrel": "kg_af",
-        })
-    )
-    df = df.merge(kg_dedup, on="ID", how="left")
-
     passed = df["status"].isin(["confirmed", "rescue"])
+
+    # Determine our alt allele (the non-reference allele on hg38+ strand).
+    # ref_match == "A1_hg38" means A1 is ref, so A2 is alt; and vice versa.
+    df["_snp_alt"] = ""
+    is_a1_ref = passed & (df["ref_match"] == "A1_hg38")
+    is_a2_ref = passed & (df["ref_match"] == "A2_hg38")
+    df.loc[is_a1_ref, "_snp_alt"] = df.loc[is_a1_ref, "A2_hg38"]
+    df.loc[is_a2_ref, "_snp_alt"] = df.loc[is_a2_ref, "A1_hg38"]
+
+    # Merge on all five columns: rsID, chrom, pos, ref, alt.
+    # For multi-allelic 1000G sites this picks the row whose alt matches
+    # our alt allele, rather than arbitrarily taking the first row.
+    # kg_af is the frequency of kg_alt in 1000G EUR unrelated.
+    kg_merge = kg.rename(columns={
+        "rsid": "ID",
+        "pos": "pos_hg38",
+        "ref": "fasta_ref",
+        "alt": "_snp_alt",
+        "af_eur_unrel": "kg_af",
+    })[["ID", "chrom", "pos_hg38", "fasta_ref", "_snp_alt", "kg_af"]]
+    kg_merge["chrom"] = kg_merge["chrom"].astype(int)
+    kg_merge["pos_hg38"] = kg_merge["pos_hg38"].astype(int)
+    df = df.merge(kg_merge, on=["ID", "chrom", "pos_hg38", "fasta_ref", "_snp_alt"],
+                  how="left")
+
     in_kg = passed & df["kg_af"].notna()
     not_in_kg = passed & df["kg_af"].isna()
 
-    print(f"  Included SNPs found in 1000G: {in_kg.sum():>10,}")
-    print(f"  Included SNPs not in 1000G:   {not_in_kg.sum():>10,}")
+    # Break down why SNPs weren't matched in 1000G
+    kg_rsids = set(kg["rsid"])
+    not_in_kg_no_rsid = not_in_kg & ~df["ID"].isin(kg_rsids)
+    not_in_kg_no_allele = not_in_kg & df["ID"].isin(kg_rsids)
 
-    # Verify chrom/pos match
-    pos_ok = in_kg & (df["chrom"].astype(str) == df["kg_chrom"]) & (df["pos_hg38"] == df["kg_pos"])
-    pos_bad = in_kg & ~pos_ok
-    if pos_bad.any():
-        print(f"  WARNING: {pos_bad.sum()} rsIDs match by ID but not by chrom/pos")
+    print(f"  Matched in 1000G:             {in_kg.sum():>10,}")
+    print(f"  Not in 1000G (rsID missing):  {not_in_kg_no_rsid.sum():>10,}")
+    print(f"  Not in 1000G (allele mismatch): {not_in_kg_no_allele.sum():>10,}")
 
-    # Compute a1_freq_kg: frequency of A1 (effect allele) in 1000G EUR unrelated
-    # kg_af = frequency of kg_alt in 1000G
+    # Compute a1_freq_kg: frequency of A1 (effect allele) in 1000G EUR.
+    # kg_af is the frequency of the alt allele. So:
+    #   A1 is our alt (ref_match == "A2_hg38") → a1_freq_kg = kg_af
+    #   A1 is our ref (ref_match == "A1_hg38") → a1_freq_kg = 1 - kg_af
     df["a1_freq_kg"] = float("nan")
+    a1_is_alt = in_kg & (df["ref_match"] == "A2_hg38")
+    a1_is_ref = in_kg & (df["ref_match"] == "A1_hg38")
+    df.loc[a1_is_alt, "a1_freq_kg"] = df.loc[a1_is_alt, "kg_af"]
+    df.loc[a1_is_ref, "a1_freq_kg"] = 1 - df.loc[a1_is_ref, "kg_af"]
 
-    sub = df.loc[pos_ok].copy()
-    freq_as_alt = sub["kg_af"]             # a1_freq if A1 is ALT
-    freq_as_ref = 1 - sub["kg_af"]         # a1_freq if A1 is REF
-
-    # Check all match types
-    a1_eq_alt = sub["A1_hg38"] == sub["kg_alt"]
-    a1_eq_ref = sub["A1_hg38"] == sub["kg_ref"]
-    a1c_eq_alt = sub["A1_hg38"].map(COMPLEMENT) == sub["kg_alt"]
-    a1c_eq_ref = sub["A1_hg38"].map(COMPLEMENT) == sub["kg_ref"]
-
-    is_alt = a1_eq_alt | a1c_eq_alt
-    is_ref = a1_eq_ref | a1c_eq_ref
-    ambiguous = is_alt & is_ref  # strand-ambiguous (A/T, C/G)
-
-    # Unambiguous: allele match determines orientation
-    use_alt = is_alt & ~ambiguous
-    use_ref = is_ref & ~ambiguous
-
-    # Ambiguous: use frequency to resolve (pick closer to A1Freq)
-    if ambiguous.any():
-        diff_alt = (sub.loc[ambiguous, "A1Freq"] - freq_as_alt[ambiguous]).abs()
-        diff_ref = (sub.loc[ambiguous, "A1Freq"] - freq_as_ref[ambiguous]).abs()
-        ambig_alt = ambiguous.copy()
-        ambig_alt.loc[:] = False
-        ambig_alt.loc[ambiguous] = (diff_alt <= diff_ref).values
-        ambig_ref = ambiguous & ~ambig_alt
-        use_alt = use_alt | ambig_alt
-        use_ref = use_ref | ambig_ref
-
-    neither = ~is_alt & ~is_ref
-
-    df.loc[sub.index[use_alt], "a1_freq_kg"] = freq_as_alt[use_alt].values
-    df.loc[sub.index[use_ref], "a1_freq_kg"] = freq_as_ref[use_ref].values
-
-    n_aligned = use_alt.sum() + use_ref.sum()
-    n_ambig = ambiguous.sum()
-    print(f"  Allele-aligned:               {n_aligned:>10,}")
-    print(f"    (strand-ambiguous resolved): {n_ambig:>10,}")
-    if neither.any():
-        print(f"  Allele mismatch (1000G):      {neither.sum():>10,}")
+    print(f"  Allele-frequency assigned:    {in_kg.sum():>10,}")
 
     # Flag large frequency differences (|A1Freq - a1_freq_kg| > 0.2)
     has_freq = df["a1_freq_kg"].notna()
@@ -566,16 +566,19 @@ def step_kg_validation(df):
 
     # Not-in-1000G list (log first 20)
     if not_in_kg.any():
-        print(f"\n  Sample rsIDs not found in 1000G (first 20):")
+        print(f"\n  Sample rsIDs not matched in 1000G (first 20):")
         for _, r in df.loc[not_in_kg, ["ID", "chrom", "pos_hg38"]].head(20).iterrows():
             print(f"    {r.ID}  chr{r.chrom}:{int(r.pos_hg38)}")
 
-    # Scatter plot
-    plot_path = os.path.join(ROOT, "allele_freq_validation.png")
+    # Scatter plot (only SNPs with a valid a1_freq_kg; unmatched SNPs
+    # are excluded entirely, not plotted at frequency 0)
+    kg_dir = os.path.join(ROOT, "kg_validation")
+    os.makedirs(kg_dir, exist_ok=True)
+    plot_path = os.path.join(kg_dir, "allele_freq_validation.png")
     _make_freq_plot(df.loc[has_freq], plot_path)
-    print(f"\n  Scatter plot: {os.path.basename(plot_path)}")
+    print(f"\n  Scatter plot: kg_validation/{os.path.basename(plot_path)}")
 
-    df.drop(columns=["kg_chrom", "kg_pos", "kg_ref", "kg_alt", "kg_af"], inplace=True)
+    df.drop(columns=["_snp_alt", "kg_af"], inplace=True)
     return df
 
 

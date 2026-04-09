@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# SBayesRC snp.info hg19 → hg38 Liftover
+# SBayesRC snp.info hg19 -> hg38 Liftover
 # =============================================================================
 # Single entry point. Sets up a Python virtual environment in tools/venv/,
 # installs dependencies, and runs the pipeline.
 #
 # Usage:
 #   bash main.sh
-#   ENSEMBL_FULL=1 bash main.sh    # exhaustive Ensembl validation (~3h, cached)
 # =============================================================================
 set -euo pipefail
 
@@ -27,5 +26,10 @@ else
     echo "[done] Python venv ready"
 fi
 
+# ---- Logging -- all subsequent output goes to both terminal and log file ----
+mkdir -p "$SCRIPT_DIR/logs"
+LOG_FILE="$SCRIPT_DIR/logs/run_$(date +%Y%m%d_%H%M%S).log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
 # ---- Run pipeline ------------------------------------------------------------
-exec "$PYTHON" -u "$SCRIPT_DIR/liftover.py" "$@"
+"$PYTHON" -u "$SCRIPT_DIR/liftover.py" "$@"

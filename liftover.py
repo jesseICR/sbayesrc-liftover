@@ -15,6 +15,7 @@ Inclusion criteria -- every SNP in sbayesrc_hg38.csv must satisfy ALL of:
   3. The dbSNP reference allele must match the hg38 FASTA reference base
   4. At least one allele (A1/A2, accounting for strand) must match the FASTA ref
   5. The other (non-ref) allele must appear in dbSNP's alt allele(s) for that rsID
+  6. If matched in 1000G EUR, |A1Freq - a1_freq_kg| must be <= 0.2
 
 Usage:
     bash main.sh
@@ -381,48 +382,39 @@ def step_fasta_validation(df):
 
     # Check 3: the non-ref allele must appear in dbSNP's alt allele(s).
     #
-    # First we figure out which strand we're on by seeing which allele
-    # (A1/A2 or their complement) matched the FASTA ref in check 2.
-    # The OTHER allele on that same strand is the non-ref allele.
-    # That non-ref allele must exist in dbSNP's comma-separated alt list.
+    # We know from check 2 which strand this SNP is on: if A1 or A2
+    # matches the FASTA ref directly, it's forward strand; if complement(A1)
+    # or complement(A2) matches, it's reverse strand. The OTHER allele on
+    # that same strand is the non-ref allele, and it must be in dbSNP's alts.
     #
-    # Example (forward strand): A1=C matches ref, so A2=T is the non-ref.
-    #   Check T is in dbSNP alts.
-    # Example (reverse strand): complement(A1)=G matches ref, so
-    #   complement(A2)=A is the non-ref. Check A is in dbSNP alts.
+    # Example (forward): A1=C matches ref → non-ref is A2=T → check T in dbSNP alts.
+    # Example (reverse): comp(A1)=G matches ref → non-ref is comp(A2)=A → check A in dbSNP alts.
     still_ok = df["status"].isin(["confirmed", "rescue"])
-    dbsnp_alt_sets = df["dbsnp_alt"].str.split(",")
 
-    def _alt_in_dbsnp(row):
+    def _find_non_ref_allele(a1, a2, ref):
+        """Given A1, A2, and the FASTA ref, return the non-ref allele
+        on whichever strand matches the ref."""
+        a1c, a2c = COMPLEMENT.get(a1, ""), COMPLEMENT.get(a2, "")
+        if   a1  == ref: return a2      # forward strand
+        elif a2  == ref: return a1      # forward strand
+        elif a1c == ref: return a2c     # reverse strand
+        elif a2c == ref: return a1c     # reverse strand
+        return None                     # shouldn't happen after check 2
+
+    def _check_alt(row):
         if not row["_still_ok"]:
-            return True  # skip already-excluded rows
+            return True
         alts = row["_dbsnp_alts"]
         if not isinstance(alts, list):
             return False
-        ref = row["fasta_ref"]
-        a1, a2 = row["A1"], row["A2"]
-        a1c = COMPLEMENT.get(a1, "")
-        a2c = COMPLEMENT.get(a2, "")
-        # Identify which strand, then pick the non-ref allele on that strand
-        if a1 == ref:
-            non_ref = a2          # forward strand: A2 is alt
-        elif a2 == ref:
-            non_ref = a1          # forward strand: A1 is alt
-        elif a1c == ref:
-            non_ref = a2c         # reverse strand: complement(A2) is alt
-        elif a2c == ref:
-            non_ref = a1c         # reverse strand: complement(A1) is alt
-        else:
-            return False          # shouldn't happen -- check 2 already verified
-        return non_ref in alts
+        non_ref = _find_non_ref_allele(row["A1"], row["A2"], row["fasta_ref"])
+        return non_ref is not None and non_ref in alts
 
     check_df = pd.DataFrame({
-        "A1": df["A1"], "A2": df["A2"],
-        "fasta_ref": df["fasta_ref"],
-        "_dbsnp_alts": dbsnp_alt_sets,
-        "_still_ok": still_ok,
+        "A1": df["A1"], "A2": df["A2"], "fasta_ref": df["fasta_ref"],
+        "_dbsnp_alts": df["dbsnp_alt"].str.split(","), "_still_ok": still_ok,
     })
-    alt_ok = check_df.apply(_alt_in_dbsnp, axis=1)
+    alt_ok = check_df.apply(_check_alt, axis=1)
     alt_mismatch = still_ok & ~alt_ok
     n_alt_mismatch = alt_mismatch.sum()
     df.loc[alt_mismatch, "status"] = "alt_mismatch"
@@ -456,20 +448,24 @@ def step_annotate(df):
         df.loc[lo_flip, "A2_hg38"] = df.loc[lo_flip, "A2"].map(COMPLEMENT)
         print(f"  Complemented {lo_flip.sum()} strand-flipped liftOver SNPs")
 
-    # Rescue SNPs: complement if needed (alleles may be on opposite strand)
+    # Rescue SNPs: complement if neither allele matches ref on the forward
+    # strand, but the complement of one allele does match.
     rescue = passed & (df["status"] == "rescue")
     if rescue.any():
-        sub = df.loc[rescue]
         ref = df.loc[rescue, "fasta_ref"]
-        no_match = (sub["A1"] != ref) & (sub["A2"] != ref)
-        comp_ok  = (sub["A1"].map(COMPLEMENT) == ref) | \
-                   (sub["A2"].map(COMPLEMENT) == ref)
-        needs = rescue & df.index.isin(sub.index[no_match & comp_ok])
-        if needs.any():
-            df.loc[needs, "A1_hg38"] = df.loc[needs, "A1"].map(COMPLEMENT)
-            df.loc[needs, "A2_hg38"] = df.loc[needs, "A2"].map(COMPLEMENT)
-            df.loc[needs, "strand_flip"] = True
-            print(f"  Complemented {needs.sum()} rescue SNPs")
+        a1  = df.loc[rescue, "A1"]
+        a2  = df.loc[rescue, "A2"]
+        forward_matches_ref = (a1 == ref) | (a2 == ref)
+        complement_matches_ref = (a1.map(COMPLEMENT) == ref) | (a2.map(COMPLEMENT) == ref)
+        needs_complement = pd.Series(False, index=df.index)
+        needs_complement.loc[rescue[rescue].index] = (
+            (~forward_matches_ref & complement_matches_ref).values
+        )
+        if needs_complement.any():
+            df.loc[needs_complement, "A1_hg38"] = df.loc[needs_complement, "A1"].map(COMPLEMENT)
+            df.loc[needs_complement, "A2_hg38"] = df.loc[needs_complement, "A2"].map(COMPLEMENT)
+            df.loc[needs_complement, "strand_flip"] = True
+            print(f"  Complemented {needs_complement.sum()} rescue SNPs")
 
     # Determine which allele matches ref
     df["ref_match"] = ""
@@ -547,36 +543,35 @@ def step_kg_validation(df):
 
     print(f"  Allele-frequency assigned:    {in_kg.sum():>10,}")
 
-    # Flag large frequency differences (|A1Freq - a1_freq_kg| > 0.2)
+    # Exclude SNPs with |A1Freq - a1_freq_kg| > 0.2
     has_freq = df["a1_freq_kg"].notna()
     freq_diff = (df.loc[has_freq, "A1Freq"] - df.loc[has_freq, "a1_freq_kg"]).abs()
     large_diff = freq_diff > 0.2
     n_large = large_diff.sum()
-    print(f"  |freq diff| > 0.2:            {n_large:>10,}")
-
     if n_large > 0:
         bad_idx = freq_diff.index[large_diff]
-        print(f"\n  rsIDs with |A1Freq - a1_freq_kg| > 0.2:")
-        for _, r in df.loc[bad_idx, ["ID", "chrom", "pos_hg38", "A1Freq", "a1_freq_kg"]].head(50).iterrows():
-            print(f"    {r.ID}  chr{r.chrom}:{int(r.pos_hg38)}  "
+        df.loc[bad_idx, "status"] = "kg_freq_diff"
+        df.loc[bad_idx, "pos_hg38"] = -1
+    print(f"  |freq diff| > 0.2 (excluded): {n_large:>10,}")
+    print(f"  Passed freq filter:           {(has_freq.sum() - n_large):>10,}")
+
+    if n_large > 0:
+        print(f"\n  Sample excluded rsIDs (first 20):")
+        for _, r in df.loc[bad_idx, ["ID", "chrom", "A1Freq", "a1_freq_kg"]].head(20).iterrows():
+            print(f"    {r.ID}  chr{r.chrom}  "
                   f"A1Freq={r.A1Freq:.4f}  kg={r.a1_freq_kg:.4f}  "
                   f"diff={abs(r.A1Freq - r.a1_freq_kg):.4f}")
-        if n_large > 50:
-            print(f"    ... and {n_large - 50} more")
 
-    # Not-in-1000G list (log first 20)
-    if not_in_kg.any():
-        print(f"\n  Sample rsIDs not matched in 1000G (first 20):")
-        for _, r in df.loc[not_in_kg, ["ID", "chrom", "pos_hg38"]].head(20).iterrows():
-            print(f"    {r.ID}  chr{r.chrom}:{int(r.pos_hg38)}")
-
-    # Scatter plot (only SNPs with a valid a1_freq_kg; unmatched SNPs
-    # are excluded entirely, not plotted at frequency 0)
+    # Plots: only SNPs that passed the freq filter
+    passed_kg = has_freq & df["status"].isin(["confirmed", "rescue"])
     kg_dir = os.path.join(ROOT, "kg_validation")
     os.makedirs(kg_dir, exist_ok=True)
-    plot_path = os.path.join(kg_dir, "allele_freq_validation.png")
-    _make_freq_plot(df.loc[has_freq], plot_path)
-    print(f"\n  Scatter plot: kg_validation/{os.path.basename(plot_path)}")
+    scatter_path = os.path.join(kg_dir, "allele_freq_validation.png")
+    ba_path = os.path.join(kg_dir, "bland_altman.png")
+    _make_freq_plot(df.loc[passed_kg], scatter_path)
+    _make_bland_altman(df.loc[passed_kg], ba_path)
+    print(f"\n  Scatter plot:     kg_validation/allele_freq_validation.png")
+    print(f"  Bland-Altman plot: kg_validation/bland_altman.png")
 
     df.drop(columns=["_snp_alt", "kg_af"], inplace=True)
     return df
@@ -591,14 +586,47 @@ def _make_freq_plot(df, path):
     y = df["a1_freq_kg"].values
 
     fig, ax = plt.subplots(figsize=(8, 8))
-    ax.scatter(x, y, s=0.1, alpha=0.05, rasterized=True)
-    ax.plot([0, 1], [0, 1], "r--", linewidth=1, alpha=0.5)
+    ax.scatter(x, y, s=0.1, alpha=1, color="black", rasterized=True)
+    ax.plot([0, 1], [0, 1], "r-", linewidth=1, alpha=0.5)
     ax.set_xlabel("A1 freq (SBayesRC snp.info)")
     ax.set_ylabel("A1 freq (1000G EUR unrelated)")
     ax.set_title(f"Allele frequency validation (n={len(df):,})")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_xticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
     ax.set_aspect("equal")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def _make_bland_altman(df, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    x = df["A1Freq"].values
+    y = df["a1_freq_kg"].values
+    mean = (x + y) / 2
+    diff = x - y
+
+    md = np.mean(diff)
+    sd = np.std(diff)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.scatter(mean, diff, s=0.1, alpha=1, color="black", rasterized=True)
+    ax.axhline(md, color="blue", linewidth=1, label=f"Mean diff: {md:.4f}")
+    ax.axhline(md + 1.96 * sd, color="red", linewidth=1, linestyle="--",
+               label=f"+1.96 SD: {md + 1.96 * sd:.4f}")
+    ax.axhline(md - 1.96 * sd, color="red", linewidth=1, linestyle="--",
+               label=f"-1.96 SD: {md - 1.96 * sd:.4f}")
+    ax.set_xlabel("Mean A1 freq (snp.info, 1000G EUR)")
+    ax.set_ylabel("Difference (snp.info - 1000G EUR)")
+    ax.set_title(f"Bland-Altman: A1 freq agreement (n={len(df):,})")
+    ax.set_xlim(-0.02, 1.02)
+    ax.legend(loc="upper right")
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -644,6 +672,21 @@ def main():
     df = step_dbsnp(df)              # 2
     df = step_fasta_validation(df)   # 3
     df = step_annotate(df)           # 4
+
+    # Check for duplicate chrom+pos among passed SNPs before 1000G validation.
+    # Two different rsIDs mapping to the same hg38 position is ambiguous.
+    passed = df["status"].isin(["confirmed", "rescue"])
+    dup_mask = passed & df.duplicated(subset=["chrom", "pos_hg38"], keep=False)
+    n_dup = dup_mask.sum()
+    if n_dup > 0:
+        df.loc[dup_mask, "status"] = "duplicate_pos"
+        df.loc[dup_mask, "pos_hg38"] = -1
+        print(f"\n  Duplicate chrom+pos excluded: {n_dup:,}")
+        for _, r in df.loc[dup_mask, ["ID", "chrom", "pos_hg38"]].head(20).iterrows():
+            print(f"    {r.ID}  chr{r.chrom}:{int(r.pos_hg38)}")
+    else:
+        print(f"\n  No duplicate chrom+pos among passed SNPs")
+
     df = step_kg_validation(df)      # 5
 
     # ---- Final summary -------------------------------------------------------
@@ -657,6 +700,8 @@ def main():
     n_fasta     = (df["status"] == "fasta_mismatch").sum()
     n_allele    = (df["status"] == "allele_mismatch").sum()
     n_alt       = (df["status"] == "alt_mismatch").sum()
+    n_dup       = (df["status"] == "duplicate_pos").sum()
+    n_kg_freq   = (df["status"] == "kg_freq_diff").sum()
 
     print(f"\n{'=' * 60}")
     print(f"FINAL SUMMARY: {n_total:,} SNPs")
@@ -665,7 +710,7 @@ def main():
     print(f"    confirmed (liftOver + dbSNP agree):  {n_confirmed:>10,}")
     print(f"    rescue    (dbSNP only):              {n_rescue:>10,}")
     print(f"    TOTAL INCLUDED:                      {n_confirmed + n_rescue:>10,}")
-    n_excluded = n_conflict + n_no_dbsnp + n_unmapped + n_fasta + n_allele + n_alt
+    n_excluded = n_conflict + n_no_dbsnp + n_unmapped + n_fasta + n_allele + n_alt + n_dup + n_kg_freq
     print(f"\n  Excluded:")
     print(f"    conflict  (liftOver != dbSNP):       {n_conflict:>10,}")
     print(f"    no_dbsnp  (rsID not in dbSNP):       {n_no_dbsnp:>10,}")
@@ -673,6 +718,8 @@ def main():
     print(f"    fasta_mismatch (dbSNP ref != FASTA): {n_fasta:>10,}")
     print(f"    allele_mismatch (no allele = ref):   {n_allele:>10,}")
     print(f"    alt_mismatch (alt not in dbSNP):     {n_alt:>10,}")
+    print(f"    duplicate_pos (same chrom+pos):      {n_dup:>10,}")
+    print(f"    kg_freq_diff  (|freq diff| > 0.2):   {n_kg_freq:>10,}")
     print(f"    TOTAL EXCLUDED:                      {n_excluded:>10,}")
     print(f"{'=' * 60}", flush=True)
 

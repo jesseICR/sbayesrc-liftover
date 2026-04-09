@@ -644,6 +644,21 @@ def main():
     df = step_dbsnp(df)              # 2
     df = step_fasta_validation(df)   # 3
     df = step_annotate(df)           # 4
+
+    # Check for duplicate chrom+pos among passed SNPs before 1000G validation.
+    # Two different rsIDs mapping to the same hg38 position is ambiguous.
+    passed = df["status"].isin(["confirmed", "rescue"])
+    dup_mask = passed & df.duplicated(subset=["chrom", "pos_hg38"], keep=False)
+    n_dup = dup_mask.sum()
+    if n_dup > 0:
+        df.loc[dup_mask, "status"] = "duplicate_pos"
+        df.loc[dup_mask, "pos_hg38"] = -1
+        print(f"\n  Duplicate chrom+pos excluded: {n_dup:,}")
+        for _, r in df.loc[dup_mask, ["ID", "chrom", "pos_hg38"]].head(20).iterrows():
+            print(f"    {r.ID}  chr{r.chrom}:{int(r.pos_hg38)}")
+    else:
+        print(f"\n  No duplicate chrom+pos among passed SNPs")
+
     df = step_kg_validation(df)      # 5
 
     # ---- Final summary -------------------------------------------------------
@@ -657,6 +672,7 @@ def main():
     n_fasta     = (df["status"] == "fasta_mismatch").sum()
     n_allele    = (df["status"] == "allele_mismatch").sum()
     n_alt       = (df["status"] == "alt_mismatch").sum()
+    n_dup       = (df["status"] == "duplicate_pos").sum()
 
     print(f"\n{'=' * 60}")
     print(f"FINAL SUMMARY: {n_total:,} SNPs")
@@ -665,7 +681,7 @@ def main():
     print(f"    confirmed (liftOver + dbSNP agree):  {n_confirmed:>10,}")
     print(f"    rescue    (dbSNP only):              {n_rescue:>10,}")
     print(f"    TOTAL INCLUDED:                      {n_confirmed + n_rescue:>10,}")
-    n_excluded = n_conflict + n_no_dbsnp + n_unmapped + n_fasta + n_allele + n_alt
+    n_excluded = n_conflict + n_no_dbsnp + n_unmapped + n_fasta + n_allele + n_alt + n_dup
     print(f"\n  Excluded:")
     print(f"    conflict  (liftOver != dbSNP):       {n_conflict:>10,}")
     print(f"    no_dbsnp  (rsID not in dbSNP):       {n_no_dbsnp:>10,}")
@@ -673,6 +689,7 @@ def main():
     print(f"    fasta_mismatch (dbSNP ref != FASTA): {n_fasta:>10,}")
     print(f"    allele_mismatch (no allele = ref):   {n_allele:>10,}")
     print(f"    alt_mismatch (alt not in dbSNP):     {n_alt:>10,}")
+    print(f"    duplicate_pos (same chrom+pos):      {n_dup:>10,}")
     print(f"    TOTAL EXCLUDED:                      {n_excluded:>10,}")
     print(f"{'=' * 60}", flush=True)
 

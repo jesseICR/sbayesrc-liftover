@@ -91,6 +91,10 @@ For all SNPs that passed steps 1-3:
 - **Rescue SNPs:** alleles are complemented if needed to match the FASTA reference strand
 - **Ref/alt determination:** determines whether A1 or A2 matches the hg38 reference
 
+### Duplicate position check
+
+After allele annotation, the pipeline checks for duplicate chrom+pos pairs among passed SNPs. If two different rsIDs map to the same hg38 position, both are excluded as `duplicate_pos` since the mapping is ambiguous.
+
 ### Step 5: 1000G EUR allele frequency validation
 
 Compares allele frequencies against 1000 Genomes European unrelated samples as a final sanity check on the liftover. The 1000G pvar file contains pre-computed `AF_EUR_unrel` values, so no genotype processing or sample filtering is needed.
@@ -118,6 +122,7 @@ For each included SNP, the pipeline:
 | `fasta_mismatch` | 0 | No |
 | `allele_mismatch` | 0 | No |
 | `alt_mismatch` | 0 | No |
+| `duplicate_pos` | 0 | No |
 | **Total input** | **7,356,518** | |
 | **Total in sbayesrc_hg38.csv** | **7,354,953** | |
 
@@ -127,6 +132,7 @@ For each included SNP, the pipeline:
 - **2 unmapped SNPs**: rs117553620 (chr17) and rs140636911 (chr19) -- no source resolves them.
 - **0 FASTA mismatches** -- every included SNP has dbSNP ref matching the hg38 FASTA reference base.
 - **0 alt mismatches** -- every included SNP's non-ref allele appears in dbSNP's alt allele(s).
+- **0 duplicate positions** -- no two passed SNPs share the same hg38 chrom+pos.
 - **12 strand-flipped SNPs** complemented (9 from liftOver chain alignment, 3 rescue SNPs).
 - **1000G validation**: 7,341,622 SNPs matched with 1000G EUR by exact allele identity, 206 with |freq diff| > 0.2. Of 7,354,953 included SNPs: 13,206 rsIDs not found in 1000G, 125 allele mismatches (rsID exists but ref/alt don't match) -- total 13,331 without a `a1_freq_kg` value.
 

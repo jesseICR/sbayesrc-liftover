@@ -386,13 +386,21 @@ def step_fasta_validation(df):
             return False
         ref = row["fasta_ref"]
         a1, a2 = row["A1"], row["A2"]
-        a1c, a2c = COMPLEMENT.get(a1, ""), COMPLEMENT.get(a2, "")
-        # The "other" allele is whichever of A1/A2 is NOT the ref (or its complement)
-        # Check that it (or its complement) appears in dbSNP alts
-        for other in [a1, a2, a1c, a2c]:
-            if other != ref and other in alts:
-                return True
-        return False
+        a1c = COMPLEMENT.get(a1, "")
+        a2c = COMPLEMENT.get(a2, "")
+        # Determine which strand we're on, then the OTHER allele on that
+        # strand is the non-ref allele to check against dbSNP alts.
+        if a1 == ref:
+            non_ref = a2
+        elif a2 == ref:
+            non_ref = a1
+        elif a1c == ref:
+            non_ref = a2c
+        elif a2c == ref:
+            non_ref = a1c
+        else:
+            return False  # shouldn't happen -- check 2 already verified
+        return non_ref in alts
 
     check_df = pd.DataFrame({
         "A1": df["A1"], "A2": df["A2"],

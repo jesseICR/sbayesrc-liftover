@@ -21,6 +21,7 @@ Output: sbayesrc_hg38.csv              (clean: chrom, pos, ref, alt, rsid)
         sbayesrc_liftover_results.csv  (verbose: all columns, all SNPs)
 """
 import gzip
+import io
 import os
 import platform
 import subprocess
@@ -45,11 +46,14 @@ CHAIN = os.path.join(TOOLS, "hg19ToHg38.over.chain.gz")
 HG38_FA = os.path.join(TOOLS, "hg38.fa")
 HG38_FA_GZ = HG38_FA + ".gz"
 DBSNP_TSV = os.path.join(TOOLS, "dbsnp_lookup.tsv")
+KG_PVAR_ZST = os.path.join(TOOLS, "kg_all.pvar.zst")
+KG_LOOKUP_TSV = os.path.join(TOOLS, "kg_eur_lookup.tsv")
 
 SNPINFO_URL = "https://github.com/jesseICR/sbayesrc-liftover/releases/download/v1.0/snp.info"
 CHAIN_URL = "https://hgdownload.soe.ucsc.edu/goldenPath/hg19/liftOver/hg19ToHg38.over.chain.gz"
 HG38_URL = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz"
 DBSNP_URL = "https://ftp.ncbi.nlm.nih.gov/snp/latest_release/VCF/GCF_000001405.40.gz"
+KG_PVAR_URL = "https://www.dropbox.com/scl/fi/fn0bcm5oseyuawxfvkcpb/all_hg38_rs.pvar.zst?rlkey=przncwb78rhz4g4ukovocdxaz&dl=1"
 
 COMPLEMENT = {"A": "T", "T": "A", "C": "G", "G": "C"}
 
@@ -113,6 +117,15 @@ def setup():
         print("  [decompress] hg38.fa.gz ...", flush=True)
         subprocess.run(["gunzip", "-k", HG38_FA_GZ], check=True)
 
+    # 1000 Genomes pvar (contains pre-computed AF_EUR_unrel in INFO)
+    if os.path.isfile(KG_PVAR_ZST):
+        print("  [skip] 1000G pvar")
+    else:
+        print("  [download] 1000G pvar.zst (~700 MB) ...", flush=True)
+        subprocess.run(
+            ["curl", "-fSL", "-o", KG_PVAR_ZST, KG_PVAR_URL], check=True,
+        )
+
 def build_dbsnp_lookup(rsid_set):
     """Stream dbSNP VCF directly from NCBI FTP, extracting rows that match our rsIDs.
     The full 28 GB VCF is streamed and decompressed on the fly -- only the small
@@ -136,7 +149,7 @@ def build_dbsnp_lookup(rsid_set):
             fields = line.split("\t", 5)
             chrom = REFSEQ_TO_CHROM.get(fields[0])
             if chrom and fields[2] in rsid_set:
-                fout.write(f"{fields[2]}\t{chrom}\t{fields[1]}\t{fields[3]}\t{fields[4].split(',')[0]}\n")
+                fout.write(f"{fields[2]}\t{chrom}\t{fields[1]}\t{fields[3]}\t{fields[4]}\n")
                 n += 1
     proc.wait()
     if proc.returncode != 0:
@@ -144,6 +157,43 @@ def build_dbsnp_lookup(rsid_set):
         sys.exit("dbSNP VCF download/stream failed")
     os.rename(tsv_tmp, DBSNP_TSV)
     print(f"  [done] {n:,} / {len(rsid_set):,} rsIDs found in dbSNP", flush=True)
+
+
+def build_kg_lookup(rsid_set):
+    """Stream 1000G pvar.zst and extract AF_EUR_unrel for matching rsIDs."""
+    if os.path.isfile(KG_LOOKUP_TSV):
+        print("  [skip] 1000G EUR lookup table", flush=True)
+        return
+    print(f"  [build] 1000G EUR lookup for {len(rsid_set):,} rsIDs "
+          f"(streaming pvar.zst) ...", flush=True)
+    import zstandard
+    dctx = zstandard.ZstdDecompressor()
+    n = 0
+    tsv_tmp = KG_LOOKUP_TSV + ".tmp"
+    with open(KG_PVAR_ZST, "rb") as fin, open(tsv_tmp, "w") as fout:
+        fout.write("rsid\tchrom\tpos\tref\talt\taf_eur_unrel\n")
+        reader = dctx.stream_reader(fin)
+        text = io.TextIOWrapper(reader, encoding="utf-8")
+        for line in text:
+            if line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 8:
+                continue
+            rsid = fields[2]
+            if rsid not in rsid_set:
+                continue
+            info = fields[7]
+            af = ""
+            for part in info.split(";"):
+                if part.startswith("AF_EUR_unrel="):
+                    af = part.split("=", 1)[1]
+                    break
+            if af:
+                fout.write(f"{rsid}\t{fields[0]}\t{fields[1]}\t{fields[3]}\t{fields[4]}\t{af}\n")
+                n += 1
+    os.rename(tsv_tmp, KG_LOOKUP_TSV)
+    print(f"  [done] {n:,} / {len(rsid_set):,} rsIDs found in 1000G EUR", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -238,21 +288,23 @@ def step_dbsnp(df):
     dbsnp = pd.read_csv(DBSNP_TSV, sep="\t", dtype={"chrom": str})
     print(f"  Loaded {len(dbsnp):,} dbSNP entries")
 
-    # Merge dbSNP chrom, pos, ref onto the dataframe
+    # Merge dbSNP chrom, pos, ref, alt onto the dataframe
     dbsnp_dedup = (
-        dbsnp[["rsid", "chrom", "pos", "ref"]]
+        dbsnp[["rsid", "chrom", "pos", "ref", "alt"]]
         .drop_duplicates("rsid")
         .rename(columns={
             "rsid": "ID",
             "chrom": "dbsnp_chrom",
             "pos": "pos_dbsnp",
             "ref": "dbsnp_ref",
+            "alt": "dbsnp_alt",
         })
     )
     df = df.merge(dbsnp_dedup, on="ID", how="left")
     df["pos_dbsnp"]    = df["pos_dbsnp"].fillna(-1).astype(int)
     df["dbsnp_chrom"]  = df["dbsnp_chrom"].fillna("")
     df["dbsnp_ref"]    = df["dbsnp_ref"].fillna("")
+    df["dbsnp_alt"]    = df["dbsnp_alt"].fillna("")
 
     # Classify each SNP (mutually exclusive, exhaustive)
     has_lo = df["pos_liftover"] != -1
@@ -320,12 +372,48 @@ def step_fasta_validation(df):
     df.loc[allele_mismatch, "status"] = "allele_mismatch"
     df.loc[allele_mismatch, "pos_hg38"] = -1
 
+    # Check 3: the non-ref allele must appear in dbSNP's alt allele(s)
+    still_ok = df["status"].isin(["confirmed", "rescue"])
+    # Determine which allele is NOT the ref (i.e. the alt) -- check both orientations
+    # dbsnp_alt may be comma-separated (multi-allelic sites)
+    dbsnp_alt_sets = df["dbsnp_alt"].str.split(",")
+
+    def _alt_in_dbsnp(row):
+        if not row["_still_ok"]:
+            return True  # skip non-checkable rows
+        alts = row["_dbsnp_alts"]
+        if not isinstance(alts, list):
+            return False
+        ref = row["fasta_ref"]
+        a1, a2 = row["A1"], row["A2"]
+        a1c, a2c = COMPLEMENT.get(a1, ""), COMPLEMENT.get(a2, "")
+        # The "other" allele is whichever of A1/A2 is NOT the ref (or its complement)
+        # Check that it (or its complement) appears in dbSNP alts
+        for other in [a1, a2, a1c, a2c]:
+            if other != ref and other in alts:
+                return True
+        return False
+
+    check_df = pd.DataFrame({
+        "A1": df["A1"], "A2": df["A2"],
+        "fasta_ref": df["fasta_ref"],
+        "_dbsnp_alts": dbsnp_alt_sets,
+        "_still_ok": still_ok,
+    })
+    alt_ok = check_df.apply(_alt_in_dbsnp, axis=1)
+    alt_mismatch = still_ok & ~alt_ok
+    n_alt_mismatch = alt_mismatch.sum()
+    df.loc[alt_mismatch, "status"] = "alt_mismatch"
+    df.loc[alt_mismatch, "pos_hg38"] = -1
+
     n_passed = df["status"].isin(["confirmed", "rescue"]).sum()
     print(f"  dbSNP ref matches FASTA ref:  {(n_check - n_fasta_mismatch):>10,}")
     print(f"  dbSNP ref != FASTA ref:       {n_fasta_mismatch:>10,}")
     print(f"  Allele matches FASTA ref:     {(n_check - n_fasta_mismatch - n_allele_mismatch):>10,}")
     print(f"  Neither allele matches ref:   {n_allele_mismatch:>10,}")
-    print(f"  Passed FASTA validation:      {n_passed:>10,}")
+    print(f"  Alt allele in dbSNP alts:     {(n_check - n_fasta_mismatch - n_allele_mismatch - n_alt_mismatch):>10,}")
+    print(f"  Alt allele not in dbSNP:      {n_alt_mismatch:>10,}")
+    print(f"  Passed all validation:        {n_passed:>10,}")
     return df
 
 
@@ -372,12 +460,147 @@ def step_annotate(df):
 
 
 # ---------------------------------------------------------------------------
+# Step 5: 1000G EUR allele frequency validation
+# ---------------------------------------------------------------------------
+def step_kg_validation(df):
+    print(f"\n[Step 5] 1000G EUR allele frequency validation", flush=True)
+
+    kg = pd.read_csv(KG_LOOKUP_TSV, sep="\t", dtype={"chrom": str, "pos": int})
+    print(f"  Loaded {len(kg):,} 1000G entries")
+
+    kg_dedup = (
+        kg.drop_duplicates("rsid")
+        .rename(columns={
+            "rsid": "ID",
+            "chrom": "kg_chrom",
+            "pos": "kg_pos",
+            "ref": "kg_ref",
+            "alt": "kg_alt",
+            "af_eur_unrel": "kg_af",
+        })
+    )
+    df = df.merge(kg_dedup, on="ID", how="left")
+
+    passed = df["status"].isin(["confirmed", "rescue"])
+    in_kg = passed & df["kg_af"].notna()
+    not_in_kg = passed & df["kg_af"].isna()
+
+    print(f"  Included SNPs found in 1000G: {in_kg.sum():>10,}")
+    print(f"  Included SNPs not in 1000G:   {not_in_kg.sum():>10,}")
+
+    # Verify chrom/pos match
+    pos_ok = in_kg & (df["chrom"].astype(str) == df["kg_chrom"]) & (df["pos_hg38"] == df["kg_pos"])
+    pos_bad = in_kg & ~pos_ok
+    if pos_bad.any():
+        print(f"  WARNING: {pos_bad.sum()} rsIDs match by ID but not by chrom/pos")
+
+    # Compute a1_freq_kg: frequency of A1 (effect allele) in 1000G EUR unrelated
+    # kg_af = frequency of kg_alt in 1000G
+    df["a1_freq_kg"] = float("nan")
+
+    sub = df.loc[pos_ok].copy()
+    freq_as_alt = sub["kg_af"]             # a1_freq if A1 is ALT
+    freq_as_ref = 1 - sub["kg_af"]         # a1_freq if A1 is REF
+
+    # Check all match types
+    a1_eq_alt = sub["A1_hg38"] == sub["kg_alt"]
+    a1_eq_ref = sub["A1_hg38"] == sub["kg_ref"]
+    a1c_eq_alt = sub["A1_hg38"].map(COMPLEMENT) == sub["kg_alt"]
+    a1c_eq_ref = sub["A1_hg38"].map(COMPLEMENT) == sub["kg_ref"]
+
+    is_alt = a1_eq_alt | a1c_eq_alt
+    is_ref = a1_eq_ref | a1c_eq_ref
+    ambiguous = is_alt & is_ref  # strand-ambiguous (A/T, C/G)
+
+    # Unambiguous: allele match determines orientation
+    use_alt = is_alt & ~ambiguous
+    use_ref = is_ref & ~ambiguous
+
+    # Ambiguous: use frequency to resolve (pick closer to A1Freq)
+    if ambiguous.any():
+        diff_alt = (sub.loc[ambiguous, "A1Freq"] - freq_as_alt[ambiguous]).abs()
+        diff_ref = (sub.loc[ambiguous, "A1Freq"] - freq_as_ref[ambiguous]).abs()
+        ambig_alt = ambiguous.copy()
+        ambig_alt.loc[:] = False
+        ambig_alt.loc[ambiguous] = (diff_alt <= diff_ref).values
+        ambig_ref = ambiguous & ~ambig_alt
+        use_alt = use_alt | ambig_alt
+        use_ref = use_ref | ambig_ref
+
+    neither = ~is_alt & ~is_ref
+
+    df.loc[sub.index[use_alt], "a1_freq_kg"] = freq_as_alt[use_alt].values
+    df.loc[sub.index[use_ref], "a1_freq_kg"] = freq_as_ref[use_ref].values
+
+    n_aligned = use_alt.sum() + use_ref.sum()
+    n_ambig = ambiguous.sum()
+    print(f"  Allele-aligned:               {n_aligned:>10,}")
+    print(f"    (strand-ambiguous resolved): {n_ambig:>10,}")
+    if neither.any():
+        print(f"  Allele mismatch (1000G):      {neither.sum():>10,}")
+
+    # Flag large frequency differences (|A1Freq - a1_freq_kg| > 0.2)
+    has_freq = df["a1_freq_kg"].notna()
+    freq_diff = (df.loc[has_freq, "A1Freq"] - df.loc[has_freq, "a1_freq_kg"]).abs()
+    large_diff = freq_diff > 0.2
+    n_large = large_diff.sum()
+    print(f"  |freq diff| > 0.2:            {n_large:>10,}")
+
+    if n_large > 0:
+        bad_idx = freq_diff.index[large_diff]
+        print(f"\n  rsIDs with |A1Freq - a1_freq_kg| > 0.2:")
+        for _, r in df.loc[bad_idx, ["ID", "chrom", "pos_hg38", "A1Freq", "a1_freq_kg"]].head(50).iterrows():
+            print(f"    {r.ID}  chr{r.chrom}:{int(r.pos_hg38)}  "
+                  f"A1Freq={r.A1Freq:.4f}  kg={r.a1_freq_kg:.4f}  "
+                  f"diff={abs(r.A1Freq - r.a1_freq_kg):.4f}")
+        if n_large > 50:
+            print(f"    ... and {n_large - 50} more")
+
+    # Not-in-1000G list (log first 20)
+    if not_in_kg.any():
+        print(f"\n  Sample rsIDs not found in 1000G (first 20):")
+        for _, r in df.loc[not_in_kg, ["ID", "chrom", "pos_hg38"]].head(20).iterrows():
+            print(f"    {r.ID}  chr{r.chrom}:{int(r.pos_hg38)}")
+
+    # Scatter plot
+    plot_path = os.path.join(ROOT, "allele_freq_validation.png")
+    _make_freq_plot(df.loc[has_freq], plot_path)
+    print(f"\n  Scatter plot: {os.path.basename(plot_path)}")
+
+    df.drop(columns=["kg_chrom", "kg_pos", "kg_ref", "kg_alt", "kg_af"], inplace=True)
+    return df
+
+
+def _make_freq_plot(df, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    x = df["A1Freq"].values
+    y = df["a1_freq_kg"].values
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.scatter(x, y, s=0.1, alpha=0.05, rasterized=True)
+    ax.plot([0, 1], [0, 1], "r--", linewidth=1, alpha=0.5)
+    ax.set_xlabel("A1 freq (SBayesRC snp.info)")
+    ax.set_ylabel("A1 freq (1000G EUR unrelated)")
+    ax.set_title(f"Allele frequency validation (n={len(df):,})")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 RESULTS_COLS = [
     "chrom", "ID", "pos_hg19", "pos_hg38", "pos_liftover", "pos_dbsnp",
     "A1", "A2", "A1_hg38", "A2_hg38",
-    "dbsnp_ref", "fasta_ref", "ref_match", "strand_flip", "status",
+    "dbsnp_ref", "dbsnp_alt", "fasta_ref", "ref_match", "strand_flip", "status",
+    "a1_freq_kg",
     "Index", "GenPos", "A1Freq", "N", "Block",
 ]
 
@@ -401,13 +624,16 @@ def main():
     df = pd.read_csv(input_file, sep="\t")
     df = df.rename(columns={"Chrom": "chrom", "PhysPos": "pos_hg19"})
     print(f"  {len(df):,} SNPs on {df['chrom'].nunique()} chromosomes")
-    build_dbsnp_lookup(set(df["ID"]))
+    rsid_set = set(df["ID"])
+    build_dbsnp_lookup(rsid_set)
+    build_kg_lookup(rsid_set)
 
     # Pipeline
     df = step_liftover(df)           # 1
     df = step_dbsnp(df)              # 2
     df = step_fasta_validation(df)   # 3
     df = step_annotate(df)           # 4
+    df = step_kg_validation(df)      # 5
 
     # ---- Final summary -------------------------------------------------------
     n_total = len(df)
@@ -419,6 +645,7 @@ def main():
     n_unmapped  = (df["status"] == "unmapped").sum()
     n_fasta     = (df["status"] == "fasta_mismatch").sum()
     n_allele    = (df["status"] == "allele_mismatch").sum()
+    n_alt       = (df["status"] == "alt_mismatch").sum()
 
     print(f"\n{'=' * 60}")
     print(f"FINAL SUMMARY: {n_total:,} SNPs")
@@ -427,13 +654,15 @@ def main():
     print(f"    confirmed (liftOver + dbSNP agree):  {n_confirmed:>10,}")
     print(f"    rescue    (dbSNP only):              {n_rescue:>10,}")
     print(f"    TOTAL INCLUDED:                      {n_confirmed + n_rescue:>10,}")
+    n_excluded = n_conflict + n_no_dbsnp + n_unmapped + n_fasta + n_allele + n_alt
     print(f"\n  Excluded:")
     print(f"    conflict  (liftOver != dbSNP):       {n_conflict:>10,}")
     print(f"    no_dbsnp  (rsID not in dbSNP):       {n_no_dbsnp:>10,}")
     print(f"    unmapped  (neither source):          {n_unmapped:>10,}")
     print(f"    fasta_mismatch (dbSNP ref != FASTA): {n_fasta:>10,}")
     print(f"    allele_mismatch (no allele = ref):   {n_allele:>10,}")
-    print(f"    TOTAL EXCLUDED:                      {n_conflict + n_no_dbsnp + n_unmapped + n_fasta + n_allele:>10,}")
+    print(f"    alt_mismatch (alt not in dbSNP):     {n_alt:>10,}")
+    print(f"    TOTAL EXCLUDED:                      {n_excluded:>10,}")
     print(f"{'=' * 60}", flush=True)
 
     # ---- Write verbose liftover results (all SNPs, all columns) ---------------

@@ -88,6 +88,18 @@ For all SNPs that passed steps 1-3:
 - **Rescue SNPs:** alleles are complemented if needed to match the FASTA reference strand
 - **Ref/alt determination:** determines whether A1 or A2 matches the hg38 reference
 
+### Step 5: 1000G EUR allele frequency validation
+
+Compares allele frequencies against 1000 Genomes European unrelated samples as a final sanity check on the liftover. The 1000G pvar file contains pre-computed `AF_EUR_unrel` values, so no genotype processing or sample filtering is needed.
+
+For each included SNP found in 1000G, the pipeline:
+1. Matches by rsID and verifies chrom/pos agreement
+2. Aligns A1 (effect allele) to the 1000G ref/alt. For strand-ambiguous SNPs (A/T, C/G), frequency-based alignment is used.
+3. Computes `a1_freq_kg` (frequency of A1 in 1000G EUR unrelated)
+4. Flags rsIDs with |A1Freq - a1_freq_kg| > 0.2
+5. Reports rsIDs not found in 1000G
+6. Generates a scatter plot (`allele_freq_validation.png`)
+
 ## Results
 
 *Numbers below are from the most recent pipeline run. Re-run `bash main.sh` to regenerate.*
@@ -110,6 +122,7 @@ For all SNPs that passed steps 1-3:
 - **2 unmapped SNPs**: rs117553620 (chr17) and rs140636911 (chr19) -- no source resolves them.
 - **0 FASTA mismatches** -- every included SNP has dbSNP ref matching the hg38 FASTA reference base.
 - **12 strand-flipped SNPs** complemented (9 from liftOver chain alignment, 3 rescue SNPs).
+- **1000G validation**: 7,333,424 SNPs allele-aligned with 1000G EUR (1,092,122 strand-ambiguous resolved via frequency), 13,075 with |freq diff| > 0.2, 13,206 not found in 1000G, 8,323 allele mismatches.
 
 ## Logging
 
@@ -163,10 +176,12 @@ Full liftover details for all 7,356,518 SNPs (including excluded):
 | A1, A2 | Original alleles from snp.info |
 | A1_hg38, A2_hg38 | Alleles on the hg38 strand (complemented if strand-flipped) |
 | dbsnp_ref | Reference allele reported by dbSNP (empty if no dbSNP entry) |
+| dbsnp_alt | Alternate allele(s) reported by dbSNP (comma-separated if multi-allelic) |
 | fasta_ref | Actual hg38 FASTA reference base at pos_hg38 (empty if excluded) |
 | ref_match | Which allele matches ref: `A1_hg38` or `A2_hg38` (empty if excluded) |
 | strand_flip | Whether alleles were complemented |
 | status | SNP classification (see [Step 2](#step-2-dbsnp-cross-validation) and [Step 3](#step-3-fasta-reference-validation)) |
+| a1_freq_kg | Frequency of A1 in 1000G EUR unrelated (NaN if not found or allele mismatch) |
 | Index, GenPos, A1Freq, N, Block | Preserved from snp.info |
 
 ## Runtime and Storage
@@ -177,17 +192,19 @@ Full liftover details for all 7,356,518 SNPs (including excluded):
 
 | Step | Description | Runtime |
 |------|-------------|---------|
-| 0 | Setup (download tools, FASTA, chain file, dbSNP VCF) | ~30 min first run, <1 s cached |
+| 0 | Setup (download tools, FASTA, chain file, 1000G pvar) | ~30 min first run, <1 s cached |
 | 0b | Build dbSNP lookup from VCF (first run only) | ~15-30 min |
+| 0c | Build 1000G EUR lookup from pvar (first run only) | ~2 min |
 | 1 | UCSC liftOver (7.36M SNPs) | ~40 s |
 | 2 | dbSNP cross-validation | ~10 s |
 | 3 | FASTA reference validation | ~10 s |
 | 4 | Allele annotation | ~10 s |
+| 5 | 1000G EUR frequency validation + scatter plot | ~30 s |
 | -- | Write output CSVs | ~20 s |
 
-**Total pipeline runtime: ~100 seconds** (cached run, all reference files present).
+**Total pipeline runtime: ~130 seconds** (cached run, all reference files present).
 
-First-run download time depends on network speed. The dbSNP VCF (~28 GB) and hg38 FASTA (~900 MB) are the largest downloads. The dbSNP lookup extraction streams the full VCF once (~15-30 min) and is cached for subsequent runs.
+First-run download time depends on network speed. The dbSNP VCF (~28 GB), hg38 FASTA (~900 MB), and 1000G pvar (~2.7 GB) are the largest downloads. The dbSNP and 1000G lookup extractions stream the source files once and are cached for subsequent runs.
 
 ### Storage
 
@@ -195,12 +212,14 @@ First-run download time depends on network speed. The dbSNP VCF (~28 GB) and hg3
 |------------------|-----:|---------|
 | `tools/hg38.fa` | 3.1 GB | GRCh38 reference FASTA (UCSC, decompressed) |
 | `tools/hg38.fa.gz` | 939 MB | Compressed FASTA (kept for re-extraction) |
-| `tools/dbsnp_lookup.tsv` | 185 MB | rsID-to-position table (streamed from 28 GB dbSNP VCF) |
-| `tools/venv/` | ~100 MB | Python virtual environment |
+| `tools/kg_all.pvar.zst` | 2.7 GB | 1000 Genomes pvar (zstd-compressed, contains AF_EUR_unrel) |
+| `tools/kg_eur_lookup.tsv` | ~200 MB | rsID-to-EUR-AF table (streamed from pvar) |
+| `tools/dbsnp_lookup.tsv` | 193 MB | rsID-to-position table (streamed from 28 GB dbSNP VCF) |
+| `tools/venv/` | ~150 MB | Python virtual environment |
 | `tools/bin/liftOver` | 24 MB | UCSC liftOver binary |
 | `tools/hg19ToHg38.over.chain.gz` | 224 KB | hg19-to-hg38 chain file |
 | `tmp/` | ~250 MB | Intermediate BED files |
-| **Total** | **~5 GB** | |
+| **Total** | **~8 GB** | |
 
 On first run, the dbSNP VCF (~28 GB) is **streamed directly** from NCBI FTP and decompressed on the fly -- only the small lookup TSV (185 MB) is saved to disk. The hg38 FASTA (~900 MB compressed) is downloaded and decompressed. All files are cached in `tools/` and reused on subsequent runs.
 
@@ -241,6 +260,7 @@ On first run, the dbSNP VCF (~28 GB) is **streamed directly** from NCBI FTP and 
 - **~1,540 SNPs have no dbSNP entry** in the current release (0.02% of 7.36M). These are excluded from the final output (`no_dbsnp` status) because they cannot be independently confirmed.
 - **Strand-ambiguous SNPs (A/T, C/G):** Strand flips are detected from the chain alignment, not from alleles. For A/T and C/G SNPs, complementing swaps labels but not nucleotides. This is correct but may look surprising in the output.
 - **dbSNP `latest_release`:** The pipeline streams from NCBI's `latest_release` URL, so the dbSNP version changes when NCBI publishes updates. The cached `dbsnp_lookup.tsv` is not automatically refreshed -- delete it to re-stream from the latest release.
+- **1000G frequency validation** is informational -- it does not exclude SNPs. Large frequency differences (>0.2) may reflect population-specific effects, multiallelic sites, or rare variants absent from 1000G EUR.
 
 ## Data Sources
 
@@ -248,4 +268,5 @@ On first run, the dbSNP VCF (~28 GB) is **streamed directly** from NCBI FTP and 
 - **hg19-to-hg38 chain file**: https://hgdownload.soe.ucsc.edu/goldenPath/hg19/liftOver/
 - **GRCh38 reference FASTA**: https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/
 - **dbSNP VCF**: https://ftp.ncbi.nlm.nih.gov/snp/latest_release/VCF/
+- **1000 Genomes pvar (hg38)**: Dropbox-hosted pfiles with pre-computed per-population allele frequencies
 - **SBayesRC**: https://github.com/zhilizheng/SBayesRC

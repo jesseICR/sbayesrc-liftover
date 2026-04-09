@@ -15,6 +15,7 @@ Inclusion criteria -- every SNP in sbayesrc_hg38.csv must satisfy ALL of:
   3. The dbSNP reference allele must match the hg38 FASTA reference base
   4. At least one allele (A1/A2, accounting for strand) must match the FASTA ref
   5. The other (non-ref) allele must appear in dbSNP's alt allele(s) for that rsID
+  6. If matched in 1000G EUR, |A1Freq - a1_freq_kg| must be <= 0.2
 
 Usage:
     bash main.sh
@@ -542,36 +543,35 @@ def step_kg_validation(df):
 
     print(f"  Allele-frequency assigned:    {in_kg.sum():>10,}")
 
-    # Flag large frequency differences (|A1Freq - a1_freq_kg| > 0.2)
+    # Exclude SNPs with |A1Freq - a1_freq_kg| > 0.2
     has_freq = df["a1_freq_kg"].notna()
     freq_diff = (df.loc[has_freq, "A1Freq"] - df.loc[has_freq, "a1_freq_kg"]).abs()
     large_diff = freq_diff > 0.2
     n_large = large_diff.sum()
-    print(f"  |freq diff| > 0.2:            {n_large:>10,}")
-
     if n_large > 0:
         bad_idx = freq_diff.index[large_diff]
-        print(f"\n  rsIDs with |A1Freq - a1_freq_kg| > 0.2:")
-        for _, r in df.loc[bad_idx, ["ID", "chrom", "pos_hg38", "A1Freq", "a1_freq_kg"]].head(50).iterrows():
-            print(f"    {r.ID}  chr{r.chrom}:{int(r.pos_hg38)}  "
+        df.loc[bad_idx, "status"] = "kg_freq_diff"
+        df.loc[bad_idx, "pos_hg38"] = -1
+    print(f"  |freq diff| > 0.2 (excluded): {n_large:>10,}")
+    print(f"  Passed freq filter:           {(has_freq.sum() - n_large):>10,}")
+
+    if n_large > 0:
+        print(f"\n  Sample excluded rsIDs (first 20):")
+        for _, r in df.loc[bad_idx, ["ID", "chrom", "A1Freq", "a1_freq_kg"]].head(20).iterrows():
+            print(f"    {r.ID}  chr{r.chrom}  "
                   f"A1Freq={r.A1Freq:.4f}  kg={r.a1_freq_kg:.4f}  "
                   f"diff={abs(r.A1Freq - r.a1_freq_kg):.4f}")
-        if n_large > 50:
-            print(f"    ... and {n_large - 50} more")
 
-    # Not-in-1000G list (log first 20)
-    if not_in_kg.any():
-        print(f"\n  Sample rsIDs not matched in 1000G (first 20):")
-        for _, r in df.loc[not_in_kg, ["ID", "chrom", "pos_hg38"]].head(20).iterrows():
-            print(f"    {r.ID}  chr{r.chrom}:{int(r.pos_hg38)}")
-
-    # Scatter plot (only SNPs with a valid a1_freq_kg; unmatched SNPs
-    # are excluded entirely, not plotted at frequency 0)
+    # Plots: only SNPs that passed the freq filter
+    passed_kg = has_freq & df["status"].isin(["confirmed", "rescue"])
     kg_dir = os.path.join(ROOT, "kg_validation")
     os.makedirs(kg_dir, exist_ok=True)
-    plot_path = os.path.join(kg_dir, "allele_freq_validation.png")
-    _make_freq_plot(df.loc[has_freq], plot_path)
-    print(f"\n  Scatter plot: kg_validation/{os.path.basename(plot_path)}")
+    scatter_path = os.path.join(kg_dir, "allele_freq_validation.png")
+    ba_path = os.path.join(kg_dir, "bland_altman.png")
+    _make_freq_plot(df.loc[passed_kg], scatter_path)
+    _make_bland_altman(df.loc[passed_kg], ba_path)
+    print(f"\n  Scatter plot:     kg_validation/allele_freq_validation.png")
+    print(f"  Bland-Altman plot: kg_validation/bland_altman.png")
 
     df.drop(columns=["_snp_alt", "kg_af"], inplace=True)
     return df
@@ -586,7 +586,7 @@ def _make_freq_plot(df, path):
     y = df["a1_freq_kg"].values
 
     fig, ax = plt.subplots(figsize=(8, 8))
-    ax.scatter(x, y, s=0.1, alpha=0.05, color="black", rasterized=True)
+    ax.scatter(x, y, s=0.1, alpha=1, color="black", rasterized=True)
     ax.plot([0, 1], [0, 1], "r-", linewidth=1, alpha=0.5)
     ax.set_xlabel("A1 freq (SBayesRC snp.info)")
     ax.set_ylabel("A1 freq (1000G EUR unrelated)")
@@ -596,6 +596,37 @@ def _make_freq_plot(df, path):
     ax.set_xticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
     ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
     ax.set_aspect("equal")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def _make_bland_altman(df, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    x = df["A1Freq"].values
+    y = df["a1_freq_kg"].values
+    mean = (x + y) / 2
+    diff = x - y
+
+    md = np.mean(diff)
+    sd = np.std(diff)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.scatter(mean, diff, s=0.1, alpha=1, color="black", rasterized=True)
+    ax.axhline(md, color="blue", linewidth=1, label=f"Mean diff: {md:.4f}")
+    ax.axhline(md + 1.96 * sd, color="red", linewidth=1, linestyle="--",
+               label=f"+1.96 SD: {md + 1.96 * sd:.4f}")
+    ax.axhline(md - 1.96 * sd, color="red", linewidth=1, linestyle="--",
+               label=f"-1.96 SD: {md - 1.96 * sd:.4f}")
+    ax.set_xlabel("Mean A1 freq (snp.info, 1000G EUR)")
+    ax.set_ylabel("Difference (snp.info - 1000G EUR)")
+    ax.set_title(f"Bland-Altman: A1 freq agreement (n={len(df):,})")
+    ax.set_xlim(-0.02, 1.02)
+    ax.legend(loc="upper right")
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -670,6 +701,7 @@ def main():
     n_allele    = (df["status"] == "allele_mismatch").sum()
     n_alt       = (df["status"] == "alt_mismatch").sum()
     n_dup       = (df["status"] == "duplicate_pos").sum()
+    n_kg_freq   = (df["status"] == "kg_freq_diff").sum()
 
     print(f"\n{'=' * 60}")
     print(f"FINAL SUMMARY: {n_total:,} SNPs")
@@ -678,7 +710,7 @@ def main():
     print(f"    confirmed (liftOver + dbSNP agree):  {n_confirmed:>10,}")
     print(f"    rescue    (dbSNP only):              {n_rescue:>10,}")
     print(f"    TOTAL INCLUDED:                      {n_confirmed + n_rescue:>10,}")
-    n_excluded = n_conflict + n_no_dbsnp + n_unmapped + n_fasta + n_allele + n_alt + n_dup
+    n_excluded = n_conflict + n_no_dbsnp + n_unmapped + n_fasta + n_allele + n_alt + n_dup + n_kg_freq
     print(f"\n  Excluded:")
     print(f"    conflict  (liftOver != dbSNP):       {n_conflict:>10,}")
     print(f"    no_dbsnp  (rsID not in dbSNP):       {n_no_dbsnp:>10,}")
@@ -687,6 +719,7 @@ def main():
     print(f"    allele_mismatch (no allele = ref):   {n_allele:>10,}")
     print(f"    alt_mismatch (alt not in dbSNP):     {n_alt:>10,}")
     print(f"    duplicate_pos (same chrom+pos):      {n_dup:>10,}")
+    print(f"    kg_freq_diff  (|freq diff| > 0.2):   {n_kg_freq:>10,}")
     print(f"    TOTAL EXCLUDED:                      {n_excluded:>10,}")
     print(f"{'=' * 60}", flush=True)
 

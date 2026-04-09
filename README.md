@@ -30,19 +30,37 @@ The ~8 GB of downloaded reference files are cached in `tools/` and reused on sub
 
 ## Why This Exists
 
+SBayesRC's `snp.info` file uses hg19 coordinates. To run GWAS with SBayesRC SNPs in hg38 genotype datasets, we need to lift them to hg38. Getting this wrong is silent and dangerous: if a SNP is mapped to the wrong hg38 position, downstream analyses will join it to the wrong variant in the genotype data, producing incorrect effect estimates with no error message.
+
+For every SNP in the final output, we need to be confident that:
+
+- **The rsID genuinely maps to that hg38 chrom + position.** We confirm this by requiring the rsID to exist in dbSNP (the canonical registry of known human variants on GRCh38). If an rsID isn't in dbSNP's current GRCh38 release, the variant may not exist on hg38, may have been merged or retired, or was never mapped to GRCh38 -- so we can't trust that it refers to a real variant at a real position.
+- **The position is correct.** We cross-validate UCSC liftOver's coordinate conversion against dbSNP's independently curated position. If they disagree, something is wrong (typically a segmental duplication region), and the SNP is discarded rather than guessing which source is right.
+- **The alleles are correct.** We verify the reference allele against the actual hg38 FASTA sequence, and check that the alternate allele is one that dbSNP recognises for that rsID. This catches cases where liftOver maps to a paralogous position that happens to share the same reference base but represents a different variant.
+- **The allele frequency is plausible.** We compare against 1000 Genomes EUR allele frequencies as a final sanity check. A large frequency discrepancy (>0.2) suggests a mapping or strand error. We use 1000 Genomes rather than dbSNP for this check because dbSNP's frequencies are aggregated across studies and populations; 1000G provides clean per-population frequencies from a well-defined reference panel, which is a better match for the European-ancestry frequencies in SBayesRC's snp.info.
+
+### The liftOver problem
+
 UCSC liftOver works well for the vast majority of SNPs, but it makes errors in **segmental duplication regions** (NBPF genes on chr1, HLA on chr6, etc.). In these regions, it can map a variant to a paralogous copy at the wrong genomic position. These errors are hard to catch: the allele may coincidentally match the reference at the wrong location, so a naive allele-vs-reference check won't flag it.
 
-This pipeline catches these errors by **cross-validating every SNP against dbSNP**. If UCSC liftOver and dbSNP disagree on where a SNP is, the SNP is discarded -- not overridden. Every included SNP must pass multiple independent checks.
+### What the pipeline does about it
 
-## Inclusion Criteria
+Every SNP is cross-validated against dbSNP. If UCSC liftOver and dbSNP disagree on where a SNP is, the SNP is discarded -- not overridden. The final output contains only SNPs that passed all checks. Of 7,356,518 input SNPs, 7,354,747 (99.98%) survive.
 
-A SNP is included in the final output (`sbayesrc_hg38.csv`) only if **all five** of these are true:
+### Strand flips
+
+Between hg19 and hg38, some genomic regions are represented on the opposite strand. UCSC liftOver detects these from the chain alignment. In the final output of 7,354,747 SNPs, only **12 have strand-flipped alleles** (9 confirmed, 3 rescue). Their A1_hg38/A2_hg38 alleles are complemented (A↔T, C↔G) relative to the original snp.info A1/A2.
+
+## What gets included
+
+Only SNPs with status `confirmed` or `rescue` make it into the final output (`sbayesrc_hg38.csv`). Everything else is excluded. A SNP must pass **all six** of these criteria:
 
 1. **Has a dbSNP entry** -- the rsID exists in dbSNP with an hg38 position on the same chromosome.
 2. **Position is confirmed** -- if UCSC liftOver produced a position, it must equal the dbSNP position. If liftOver failed, the dbSNP position alone is accepted ("rescue").
 3. **dbSNP ref matches the genome** -- the reference allele that dbSNP reports for this rsID must equal the actual base in the hg38 FASTA at that position.
 4. **One allele matches the reference** -- at least one of A1 or A2 (or their strand complement) must equal the hg38 FASTA reference base.
 5. **The other allele is in dbSNP's alts** -- the non-reference allele (on the same strand that matched the ref) must appear in dbSNP's ALT field for this rsID.
+6. **Allele frequency agreement** -- if the SNP is found in 1000 Genomes EUR, |A1Freq - a1_freq_kg| must be <= 0.2. SNPs not found in 1000G are not penalised.
 
 Any failure on any criterion means the SNP is excluded.
 
@@ -97,17 +115,15 @@ For all SNPs that passed steps 1-3:
 
 After annotation, the pipeline checks whether any two passed SNPs share the same hg38 chrom + position. If so, both are excluded as `duplicate_pos` -- the mapping is ambiguous.
 
-### Step 5: 1000G EUR allele frequency validation
+### Step 5: 1000G EUR allele frequency QC
 
-Compares allele frequencies against 1000 Genomes European unrelated samples as a **sanity check**. This step is informational only -- it does not exclude any SNPs.
+Compares allele frequencies against 1000 Genomes European unrelated samples. **SNPs with |A1Freq - a1_freq_kg| > 0.2 are excluded** as `kg_freq_diff`. SNPs not found in 1000G are kept (they are not penalised).
 
 The 1000G pvar file contains pre-computed `AF_EUR_unrel` values, so no genotype processing or sample filtering is needed.
 
 **How allele matching works:** Both our output and 1000G are on the hg38 forward strand, so we match by exact identity -- no strand complement logic. The merge uses all five columns (rsID + chrom + pos + ref + alt). This correctly handles multi-allelic sites in 1000G, where the same rsID has multiple rows with different alt alleles: only the row with our specific alt allele matches.
 
 **What `a1_freq_kg` means:** `AF_EUR_unrel` in the pvar is the frequency of the ALT allele. If A1 is the alt → `a1_freq_kg = AF_EUR_unrel`. If A1 is the ref → `a1_freq_kg = 1 - AF_EUR_unrel`.
-
-The pipeline flags SNPs with |A1Freq - a1_freq_kg| > 0.2 and generates a scatter plot.
 
 ## Results
 
@@ -117,7 +133,7 @@ The pipeline flags SNPs with |A1Freq - a1_freq_kg| > 0.2 and generates a scatter
 
 | Status | Count | In final output? |
 |--------|------:|:-----------------:|
-| `confirmed` | 7,352,740 | Yes |
+| `confirmed` | 7,352,534 | Yes |
 | `rescue` | 2,213 | Yes |
 | `conflict` | 25 | No |
 | `no_dbsnp` | 1,538 | No |
@@ -126,8 +142,9 @@ The pipeline flags SNPs with |A1Freq - a1_freq_kg| > 0.2 and generates a scatter
 | `allele_mismatch` | 0 | No |
 | `alt_mismatch` | 0 | No |
 | `duplicate_pos` | 0 | No |
+| `kg_freq_diff` | 206 | No |
 | **Total input** | **7,356,518** | |
-| **Total in sbayesrc_hg38.csv** | **7,354,953** | |
+| **Total in sbayesrc_hg38.csv** | **7,354,747** | |
 
 ### Notes on excluded SNPs
 
@@ -136,23 +153,25 @@ The pipeline flags SNPs with |A1Freq - a1_freq_kg| > 0.2 and generates a scatter
 - **2 unmapped** -- rs117553620 (chr17) and rs140636911 (chr19). Neither liftOver nor dbSNP resolves them.
 - **0 fasta/allele/alt mismatches** -- every included SNP's alleles are consistent with the hg38 FASTA and dbSNP.
 - **0 duplicate positions** -- no two passed SNPs share the same hg38 chrom + pos.
+- **206 kg_freq_diff** -- allele frequency in snp.info differs from 1000G EUR by more than 0.2. Likely mapping errors or population stratification artefacts.
 
-### Strand flips
+### 1000G allele frequency QC
 
-12 SNPs had their alleles complemented: 9 detected from the liftOver chain alignment, 3 rescue SNPs complemented to match the FASTA reference strand.
+Of the 7,354,953 SNPs that passed steps 1-4:
 
-### 1000G allele frequency validation
+- **7,341,622** (99.8%) matched a 1000G entry on rsID + chrom + pos + ref + alt
+- **13,206** had an rsID not present in 1000G at all
+- **125** had the rsID in 1000G but with a different alt allele (multi-allelic site where 1000G only has a different variant)
+- **206** matched SNPs had |A1Freq - a1_freq_kg| > 0.2 and were **excluded**
+- **7,341,416** matched SNPs passed the frequency filter
+
+Of the **7,354,747** SNPs in the final output, **7,341,416** (99.8%) have a 1000G EUR allele frequency. The remaining 13,331 are not in 1000G.
 
 ![Allele frequency validation](kg_validation/allele_freq_validation.png)
 
-Of the 7,354,953 included SNPs:
+![Bland-Altman plot](kg_validation/bland_altman.png)
 
-- **7,341,622** matched a 1000G entry on rsID + chrom + pos + ref + alt
-- **13,206** had an rsID not present in 1000G at all
-- **125** had the rsID in 1000G but with a different alt allele (multi-allelic site where 1000G only has a different variant)
-- **206** matched SNPs had |A1Freq - a1_freq_kg| > 0.2
-
-SNPs not matched in 1000G are not plotted in the scatter plot (they are not given a frequency of 0).
+Both plots show only the 7,341,416 SNPs that passed the frequency filter. SNPs not found in 1000G are not plotted.
 
 ## Logging
 
@@ -210,13 +229,13 @@ One row per input SNP (7,356,518 rows), including excluded SNPs:
 | fasta_ref | Actual hg38 FASTA base at pos_hg38 (empty if excluded before this check) |
 | ref_match | Which allele matches the hg38 ref: `A1_hg38` or `A2_hg38` (empty if excluded) |
 | strand_flip | Whether alleles were complemented (`True`/`False`) |
-| status | One of: `confirmed`, `rescue`, `conflict`, `no_dbsnp`, `unmapped`, `fasta_mismatch`, `allele_mismatch`, `alt_mismatch`, `duplicate_pos` |
+| status | One of: `confirmed`, `rescue`, `conflict`, `no_dbsnp`, `unmapped`, `fasta_mismatch`, `allele_mismatch`, `alt_mismatch`, `duplicate_pos`, `kg_freq_diff` |
 | a1_freq_kg | Frequency of A1 in 1000G EUR unrelated (`NaN` if not matched in 1000G) |
 | Index, GenPos, A1Freq, N, Block | Preserved from snp.info |
 
-### `kg_validation/allele_freq_validation.png`
+### `kg_validation/allele_freq_validation.png` and `bland_altman.png`
 
-Scatter plot of SBayesRC A1 frequency vs 1000G EUR A1 frequency. Only SNPs with a valid `a1_freq_kg` are plotted.
+Scatter plot and Bland-Altman plot of SBayesRC A1 frequency vs 1000G EUR A1 frequency. Only SNPs that passed the frequency filter are plotted.
 
 ## Runtime and Storage
 
@@ -272,7 +291,8 @@ First-run download time depends on network speed. The dbSNP VCF (~28 GB), hg38 F
 ├── README.md
 ├── logs/                       Timestamped run logs (gitignored)
 ├── kg_validation/              1000G validation output (git-tracked)
-│   └── allele_freq_validation.png
+│   ├── allele_freq_validation.png
+│   └── bland_altman.png
 ├── tools/                      Downloaded reference files (gitignored)
 │   ├── bin/liftOver
 │   ├── venv/
@@ -294,7 +314,7 @@ First-run download time depends on network speed. The dbSNP VCF (~28 GB), hg38 F
 - **~1,540 SNPs have no dbSNP entry** (0.02% of 7.36M). These are excluded because they cannot be independently confirmed.
 - **Strand-ambiguous SNPs (A/T, C/G):** Strand flips are detected from the chain alignment, not from the alleles themselves. For A/T and C/G SNPs, complementing swaps the labels but not the nucleotide identity. This is correct but may look surprising in the output.
 - **dbSNP version:** The pipeline streams from NCBI's `latest_release` URL, so the dbSNP version changes when NCBI publishes updates. The cached `dbsnp_lookup.tsv` is not automatically refreshed -- delete it to re-stream.
-- **1000G validation is informational only** -- it does not exclude SNPs. Large frequency differences (>0.2) may reflect population-specific effects, multi-allelic sites, or rare variants.
+- **1000G frequency filter** -- SNPs with |A1Freq - a1_freq_kg| > 0.2 are excluded. SNPs not found in 1000G at all are kept. The 0.2 threshold is conservative; large differences typically indicate mapping or strand errors rather than genuine population effects.
 
 ## Data Sources
 

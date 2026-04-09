@@ -127,8 +127,6 @@ The 1000G pvar file contains pre-computed `AF_EUR_unrel` values, so no genotype 
 
 ## Results
 
-*Numbers below are from the most recent pipeline run. Re-run `bash main.sh` to regenerate.*
-
 ### Status breakdown
 
 | Status | Count | In final output? |

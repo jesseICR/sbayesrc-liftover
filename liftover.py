@@ -54,7 +54,7 @@ DBSNP_TSV = os.path.join(TOOLS, "dbsnp_lookup.tsv")
 KG_PVAR_ZST = os.path.join(TOOLS, "kg_all.pvar.zst")
 KG_LOOKUP_TSV = os.path.join(TOOLS, "kg_eur_lookup.tsv")
 
-SNPINFO_URL = "https://github.com/jesseICR/sbayesrc-liftover/releases/download/v1.0/snp.info"
+SNPINFO_URL = "https://github.com/human-genomics/sbayesrc-liftover/releases/download/v1.0/snp.info"
 CHAIN_URL = "https://hgdownload.soe.ucsc.edu/goldenPath/hg19/liftOver/hg19ToHg38.over.chain.gz"
 HG38_URL = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz"
 DBSNP_URL = "https://ftp.ncbi.nlm.nih.gov/snp/latest_release/VCF/GCF_000001405.40.gz"

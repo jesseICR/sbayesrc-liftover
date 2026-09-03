@@ -6,10 +6,10 @@ Reproducible pipeline to lift the [SBayesRC](https://github.com/zhilizheng/SBaye
 
 **No pipeline run required.** Download the output files directly:
 
-- [**`sbayesrc_hg38.csv`**](https://github.com/jesseICR/sbayesrc-liftover/releases/download/v1.0/sbayesrc_hg38.csv) (184 MB) -- 7,354,747 SNPs, 5 columns: chrom, pos, ref, alt, rsid
-- [**`sbayesrc_liftover_results.csv`**](https://github.com/jesseICR/sbayesrc-liftover/releases/download/v1.0/sbayesrc_liftover_results.csv) (893 MB) -- all 7,356,518 input SNPs with full annotation and QC status
+- [**`sbayesrc_hg38.csv`**](https://github.com/human-genomics/sbayesrc-liftover/releases/download/v1.0/sbayesrc_hg38.csv) (184 MB) -- 7,354,747 SNPs, 5 columns: chrom, pos, ref, alt, rsid
+- [**`sbayesrc_liftover_results.csv`**](https://github.com/human-genomics/sbayesrc-liftover/releases/download/v1.0/sbayesrc_liftover_results.csv) (893 MB) -- all 7,356,518 input SNPs with full annotation and QC status
 
-The input file is also available: [`snp.info`](https://github.com/jesseICR/sbayesrc-liftover/releases/download/v1.0/snp.info) (380 MB). See all assets on the [Releases](https://github.com/jesseICR/sbayesrc-liftover/releases) page.
+The input file is also available: [`snp.info`](https://github.com/human-genomics/sbayesrc-liftover/releases/download/v1.0/snp.info) (380 MB). See all assets on the [Releases](https://github.com/human-genomics/sbayesrc-liftover/releases) page.
 
 ### `sbayesrc_hg38.csv` (primary output)
 
@@ -52,13 +52,13 @@ The script creates a virtual environment, installs dependencies, downloads all r
 
 ```bash
 # Pull pre-built image
-docker pull ghcr.io/jesseicr/sbayesrc-liftover:latest
+docker pull ghcr.io/human-genomics/sbayesrc-liftover:latest
 
 # Or build locally
 docker build -t sbayesrc-liftover .
 
 # Run (mount the repo directory so downloads persist and output is accessible)
-docker run --rm -v $(pwd):/data ghcr.io/jesseicr/sbayesrc-liftover:latest
+docker run --rm -v $(pwd):/data ghcr.io/human-genomics/sbayesrc-liftover:latest
 ```
 
 The ~8 GB of downloaded reference files are cached in `tools/` and reused on subsequent runs.

@@ -12,14 +12,14 @@
 #   docker run --rm -v $(pwd):/data sbayesrc-liftover
 #
 # Pull from GHCR instead of building locally:
-#   docker pull ghcr.io/jesseicr/sbayesrc-liftover:latest
-#   docker run --rm -v $(pwd):/data ghcr.io/jesseicr/sbayesrc-liftover:latest
+#   docker pull ghcr.io/human-genomics/sbayesrc-liftover:latest
+#   docker run --rm -v $(pwd):/data ghcr.io/human-genomics/sbayesrc-liftover:latest
 #
 # =============================================================================
 
 FROM python:3.11-slim-bookworm
 
-LABEL org.opencontainers.image.source="https://github.com/jesseICR/sbayesrc-liftover"
+LABEL org.opencontainers.image.source="https://github.com/human-genomics/sbayesrc-liftover"
 LABEL org.opencontainers.image.description="SBayesRC snp.info hg19 to hg38 liftover with dbSNP position verification"
 LABEL org.opencontainers.image.licenses="MIT"
 
